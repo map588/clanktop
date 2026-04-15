@@ -159,7 +159,7 @@ Debug output writes to `/tmp/clanktop-debug.log` and includes scanner ticks, pro
 
 ## Limitations
 
-- **macOS only** — uses `ps` command and gopsutil's libproc wrappers. Linux support is feasible but untested.
+- **macOS only**: uses `ps` command and gopsutil's libproc wrappers. Linux support is feasible but untested.
 - **No elevated privileges**: kqueue `EVFILT_PROC` is blocked by SIP on macOS, so we use fast polling instead of event-driven process monitoring.
 - **Sub-20ms processes**: processes that spawn and exit within a single poll interval are only visible through JSONL log data, not in the process tree.
 - **Claude Code only**: the backend interface supports other clients, but only Claude Code is implemented.

@@ -7,9 +7,8 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/shirou/gopsutil/v3/process"
-
 	"github.com/map588/clanktop/internal/model"
+	"github.com/map588/clanktop/internal/process"
 )
 
 // Common tool process names that Claude Code spawns.
@@ -30,11 +29,6 @@ var toolProcessNames = map[string]bool{
 	"go": true,
 }
 
-// Hidden processes — system noise, never shown in tree.
-var hiddenProcessNames = map[string]bool{
-	"caffeinate": true,
-}
-
 // Infra process names (long-lived system utilities).
 var infraProcessNames = map[string]bool{
 	"fswatch": true, "watchman": true,
@@ -47,18 +41,6 @@ var mcpServerPatterns = []string{
 	"modelcontextprotocol",
 }
 
-// Path prefixes to filter out from file access tracking.
-var filteredPathPrefixes = []string{
-	"node_modules/",
-	"/usr/lib/",
-	"/usr/local/lib/",
-	"/System/",
-	"/Library/",
-	"/opt/homebrew/",
-	"/private/var/",
-	"/tmp/",
-	"/var/folders/",
-}
 
 // Matches eval '<command>' in shell wrapper commands
 var evalPattern = regexp.MustCompile(`eval '([^']*)'`)
@@ -78,21 +60,19 @@ func (c *ClaudeCode) Name() string {
 }
 
 func (c *ClaudeCode) FindRootProcess() (int32, error) {
-	procs, err := process.Processes()
+	entries, err := process.ScanProcesses()
 	if err != nil {
 		return 0, fmt.Errorf("listing processes: %w", err)
 	}
 
 	var candidates []int32
-	for _, p := range procs {
-		cmdline, err := p.CmdlineSlice()
-		if err != nil || len(cmdline) == 0 {
-			continue
+	for _, e := range entries {
+		base := e.Comm
+		if len(e.Cmdline) > 0 {
+			base = filepath.Base(e.Cmdline[0])
 		}
-
-		base := filepath.Base(cmdline[0])
 		if base == "claude" {
-			candidates = append(candidates, p.Pid)
+			candidates = append(candidates, e.PID)
 		}
 	}
 

@@ -2,13 +2,10 @@ package process
 
 import (
 	"context"
-	"fmt"
 	"path/filepath"
 	"time"
 
 	"github.com/map588/clanktop/internal/debug"
-
-	"github.com/shirou/gopsutil/v3/process"
 
 	"github.com/map588/clanktop/internal/bus"
 	"github.com/map588/clanktop/internal/model"
@@ -155,54 +152,6 @@ func (s *Scanner) tick() {
 	})
 }
 
-func (s *Scanner) buildTree() (*model.ProcessInfo, []*model.ProcessInfo, error) {
-	procs, err := process.Processes()
-	if err != nil {
-		return nil, nil, fmt.Errorf("listing processes: %w", err)
-	}
-
-	// Build flat map of all processes
-	infoMap := make(map[int32]*model.ProcessInfo, len(procs))
-	for _, p := range procs {
-		info := processToInfo(p)
-		if info != nil {
-			infoMap[info.PID] = info
-		}
-	}
-
-	// Find root
-	root, ok := infoMap[s.rootPID]
-	if !ok {
-		return nil, nil, fmt.Errorf("root PID %d not found", s.rootPID)
-	}
-
-	// Build tree by attaching children to parents
-	for _, info := range infoMap {
-		if parent, ok := infoMap[info.PPID]; ok && info.PID != s.rootPID {
-			parent.Children = append(parent.Children, info)
-		}
-	}
-
-	// Collect only descendants of root
-	var allProcs []*model.ProcessInfo
-	var collect func(*model.ProcessInfo)
-	collect = func(node *model.ProcessInfo) {
-		allProcs = append(allProcs, node)
-		for _, child := range node.Children {
-			collect(child)
-		}
-	}
-	debug.Log("TREE root=%d children=%d", s.rootPID, len(root.Children))
-	collect(root)
-
-	// Enrich only descendants with expensive fields
-	for _, p := range allProcs {
-		enrichProcessInfo(p)
-	}
-
-	return root, allProcs, nil
-}
-
 func filterHidden(node *model.ProcessInfo) {
 	filtered := node.Children[:0]
 	for _, c := range node.Children {
@@ -210,7 +159,7 @@ func filterHidden(node *model.ProcessInfo) {
 		if len(c.Cmdline) > 0 {
 			name = filepath.Base(c.Cmdline[0])
 		}
-		if name == "caffeinate" {
+		if hiddenProcessNames[name] {
 			continue
 		}
 		filterHidden(c)
@@ -229,38 +178,6 @@ func findNode(root *model.ProcessInfo, pid int32) *model.ProcessInfo {
 		}
 	}
 	return nil
-}
-
-func processToInfo(p *process.Process) *model.ProcessInfo {
-	pid := p.Pid
-	ppid, _ := p.Ppid()
-	name, _ := p.Name()
-	cmdline, _ := p.CmdlineSlice()
-
-	return &model.ProcessInfo{
-		PID:     pid,
-		PPID:    ppid,
-		Name:    name,
-		Cmdline: cmdline,
-	}
-}
-
-// enrichProcessInfo adds expensive fields (CPU, mem, state) to a process.
-func enrichProcessInfo(info *model.ProcessInfo) {
-	p, err := process.NewProcess(info.PID)
-	if err != nil {
-		return
-	}
-	info.CPUPercent, _ = p.CPUPercent()
-	if memInfo, err := p.MemoryInfo(); err == nil && memInfo != nil {
-		info.RSS = memInfo.RSS
-	}
-	if status, err := p.Status(); err == nil && len(status) > 0 {
-		info.State = status[0]
-	}
-	if ct, err := p.CreateTime(); err == nil {
-		info.StartTime = time.UnixMilli(ct)
-	}
 }
 
 // RecordExited adds a process to the exited process map from an external source (kqueue).

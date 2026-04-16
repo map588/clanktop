@@ -1,13 +1,14 @@
+//go:build !linux
+
 package process
 
 import (
 	"context"
 	"fmt"
+	"os"
 	"path/filepath"
-	"strings"
 	"syscall"
 	"time"
-	"unsafe"
 
 	"github.com/map588/clanktop/internal/debug"
 	"github.com/map588/clanktop/internal/model"
@@ -15,29 +16,44 @@ import (
 	gopsutil "github.com/shirou/gopsutil/v3/process"
 )
 
-// ProcEvent represents a process lifecycle event.
-type ProcEvent struct {
-	PID       int32
-	ParentPID int32
-	Type      string // "fork", "exec", "exit"
-	Time      time.Time
-	Info      *model.ProcessInfo // populated on fork/exec
-}
-
 // KqueueWatcher uses kqueue EVFILT_PROC to get real-time process events.
+// Requires root privileges; SIP blocks EVFILT_PROC for non-root on macOS.
 type KqueueWatcher struct {
 	rootPID   int32
 	kq        int
 	events    chan ProcEvent
 	watching  map[int32]bool
-	procCache map[int32]*model.ProcessInfo // cache info from fork/exec for exit lookup
+	procCache map[int32]*model.ProcessInfo
 }
 
-func NewKqueueWatcher(rootPID int32) (*KqueueWatcher, error) {
+// NewProcWatcher creates a kqueue-based process watcher.
+// Returns ErrNotAvailable if not running as root or if SIP blocks kqueue EVFILT_PROC.
+func NewProcWatcher(rootPID int32) (ProcWatcher, error) {
+	if os.Geteuid() != 0 {
+		return nil, fmt.Errorf("%w: not running as root (euid=%d)", ErrNotAvailable, os.Geteuid())
+	}
+
 	kq, err := syscall.Kqueue()
 	if err != nil {
-		return nil, fmt.Errorf("kqueue: %w", err)
+		return nil, fmt.Errorf("%w: kqueue: %v", ErrNotAvailable, err)
 	}
+
+	// Probe: try attaching EVFILT_PROC to the target PID.
+	// SIP blocks this for processes you don't own, even as root.
+	probe := syscall.Kevent_t{
+		Ident:  uint64(rootPID),
+		Filter: syscall.EVFILT_PROC,
+		Flags:  syscall.EV_ADD | syscall.EV_ENABLE,
+		Fflags: syscall.NOTE_EXIT,
+	}
+	_, err = syscall.Kevent(kq, []syscall.Kevent_t{probe}, nil, nil)
+	if err != nil {
+		syscall.Close(kq)
+		return nil, fmt.Errorf("%w: SIP blocks EVFILT_PROC on PID %d: %v", ErrNotAvailable, rootPID, err)
+	}
+	// Probe succeeded — upgrade to full tracking (remove probe, watchPID adds NOTE_FORK etc.)
+	probe.Flags = syscall.EV_DELETE
+	syscall.Kevent(kq, []syscall.Kevent_t{probe}, nil, nil)
 
 	w := &KqueueWatcher{
 		rootPID:   rootPID,
@@ -47,15 +63,12 @@ func NewKqueueWatcher(rootPID int32) (*KqueueWatcher, error) {
 		procCache: make(map[int32]*model.ProcessInfo),
 	}
 
-	// Watch root process
 	if err := w.watchPID(rootPID); err != nil {
 		syscall.Close(kq)
-		return nil, fmt.Errorf("watch root %d: %w", rootPID, err)
+		return nil, fmt.Errorf("%w: watch root %d: %v", ErrNotAvailable, rootPID, err)
 	}
 
-	// Watch existing children too
 	w.watchExistingChildren(rootPID)
-
 	return w, nil
 }
 
@@ -82,11 +95,6 @@ func (w *KqueueWatcher) watchPID(pid int32) error {
 }
 
 func (w *KqueueWatcher) watchExistingChildren(pid int32) {
-	p, err := gopsutil.NewProcess(pid)
-	if err != nil {
-		return
-	}
-	// gopsutil Children() broken on macOS, enumerate manually
 	procs, _ := gopsutil.Processes()
 	for _, proc := range procs {
 		ppid, err := proc.Ppid()
@@ -98,15 +106,12 @@ func (w *KqueueWatcher) watchExistingChildren(pid int32) {
 			w.watchExistingChildren(proc.Pid)
 		}
 	}
-	_ = p
 }
 
-// Events returns the event channel.
 func (w *KqueueWatcher) Events() <-chan ProcEvent {
 	return w.events
 }
 
-// Run listens for kqueue events until context cancelled.
 func (w *KqueueWatcher) Run(ctx context.Context) {
 	defer syscall.Close(w.kq)
 	defer close(w.events)
@@ -136,11 +141,7 @@ func (w *KqueueWatcher) Run(ctx context.Context) {
 			pid := int32(ev.Ident)
 
 			if ev.Fflags&syscall.NOTE_FORK != 0 {
-				// Child PID comes from NOTE_CHILD on tracked events
-				// For NOTE_FORK, the ident is the PARENT that forked
 				debug.Log("KQUEUE FORK parent=%d", pid)
-
-				// Find new child by scanning children of this pid
 				go w.detectNewChild(pid, now)
 			}
 
@@ -160,7 +161,6 @@ func (w *KqueueWatcher) Run(ctx context.Context) {
 
 			if ev.Fflags&syscall.NOTE_EXIT != 0 {
 				debug.Log("KQUEUE EXIT pid=%d", pid)
-				// Use cached info from fork/exec
 				cached := w.procCache[pid]
 				w.events <- ProcEvent{
 					PID:  pid,
@@ -172,7 +172,6 @@ func (w *KqueueWatcher) Run(ctx context.Context) {
 				delete(w.procCache, pid)
 			}
 
-			// NOTE_CHILD: auto-tracked child process
 			if ev.Fflags&syscall.NOTE_CHILD != 0 {
 				childPID := int32(ev.Ident)
 				debug.Log("KQUEUE CHILD pid=%d", childPID)
@@ -189,7 +188,6 @@ func (w *KqueueWatcher) Run(ctx context.Context) {
 				}
 			}
 
-			// NOTE_TRACKERR: couldn't auto-track
 			if ev.Fflags&noteTrackerr() != 0 {
 				debug.Log("KQUEUE TRACKERR pid=%d", pid)
 			}
@@ -198,7 +196,6 @@ func (w *KqueueWatcher) Run(ctx context.Context) {
 }
 
 func (w *KqueueWatcher) detectNewChild(parentPID int32, when time.Time) {
-	// Brief delay to let child process start
 	time.Sleep(10 * time.Millisecond)
 
 	procs, _ := gopsutil.Processes()
@@ -233,7 +230,6 @@ func getProcessInfo(pid int32) *model.ProcessInfo {
 	ppid, _ := p.Ppid()
 	name, _ := p.Name()
 	cmdline, _ := p.CmdlineSlice()
-	cpuPct, _ := p.CPUPercent()
 	memInfo, _ := p.MemoryInfo()
 	var rss uint64
 	if memInfo != nil {
@@ -246,35 +242,23 @@ func getProcessInfo(pid int32) *model.ProcessInfo {
 	}
 	createTime, _ := p.CreateTime()
 
-	// Better display name from cmdline
-	displayName := name
 	if len(cmdline) > 0 {
-		base := filepath.Base(cmdline[0])
-		if base != "" && base != "." {
-			displayName = base
+		if base := filepath.Base(cmdline[0]); base != "" && base != "." {
+			name = base
 		}
 	}
-	_ = displayName
-	_ = strings.ToLower // keep import
 
 	return &model.ProcessInfo{
-		PID:        pid,
-		PPID:       ppid,
-		Name:       name,
-		Cmdline:    cmdline,
-		CPUPercent: cpuPct,
-		RSS:        rss,
-		State:      stateStr,
-		StartTime:  time.UnixMilli(createTime),
+		PID:       pid,
+		PPID:      ppid,
+		Name:      name,
+		Cmdline:   cmdline,
+		RSS:       rss,
+		State:     stateStr,
+		StartTime: time.UnixMilli(createTime),
 	}
 }
 
-// noteTrackerr returns NOTE_TRACKERR value.
-// Not exported by syscall package on all versions.
 func noteTrackerr() uint32 {
-	// NOTE_TRACKERR = 0x00000002 on macOS
 	return 0x00000002
 }
-
-// Ensure unsafe import used (for potential future use)
-var _ = unsafe.Sizeof(0)

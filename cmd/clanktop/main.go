@@ -12,7 +12,6 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
-	gopsutil "github.com/shirou/gopsutil/v3/process"
 
 	"github.com/map588/clanktop/internal/agent"
 	"github.com/map588/clanktop/internal/backend"
@@ -104,8 +103,14 @@ func main() {
 	go scanner.Run(ctx)
 	go tailer.Run(ctx)
 
-	// Note: kqueue EVFILT_PROC doesn't work on macOS with SIP.
-	// Using fast polling (50ms) instead to catch short-lived processes.
+	// Event-driven process watcher (kqueue on macOS, netlink on Linux).
+	// Supplements polling — catches sub-20ms processes. Requires elevated privileges.
+	watcher, watcherErr := process.NewProcWatcher(rootPID)
+	if watcherErr == nil {
+		go watcher.Run(ctx)
+	} else {
+		process.PrintWatcherHint(watcherErr, *pollInterval)
+	}
 
 	// JSONL watcher — tail Claude Code session logs for tool calls
 	jsonlWatcher := logtailer.NewJSONLWatcher(projectDir, eventBus)
@@ -136,11 +141,7 @@ func waitForProcess(be backend.ClientBackend) int32 {
 }
 
 func detectProjectDir(pid int32) string {
-	p, err := gopsutil.NewProcess(pid)
-	if err != nil {
-		return ""
-	}
-	cwd, err := p.Cwd()
+	cwd, err := process.GetProcessCwd(pid)
 	if err != nil {
 		return ""
 	}

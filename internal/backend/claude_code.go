@@ -84,6 +84,13 @@ func (c *ClaudeCode) Hidden(proc *model.ProcessInfo) bool {
 	return cmdBase(proc) == "caffeinate"
 }
 
+// HostsSessions is true for the Claude Code daemon ("claude daemon run"). The
+// first session that needs it starts it. It then hosts the background
+// sessions of all sessions.
+func (c *ClaudeCode) HostsSessions(proc *model.ProcessInfo) bool {
+	return cmdBase(proc) == "claude" && len(proc.Cmdline) > 1 && proc.Cmdline[1] == "daemon"
+}
+
 func (c *ClaudeCode) Label(proc *model.ProcessInfo) string {
 	if cmd := ExtractToolFromWrapper(proc.Cmdline); cmd != "" {
 		first, _, _ := strings.Cut(cmd, "\n")

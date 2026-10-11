@@ -15,6 +15,9 @@ type ClientBackend interface {
 	ClassifyChild(proc *model.ProcessInfo) model.ProcessRole
 	// Hidden is true for processes that the tree must not show.
 	Hidden(proc *model.ProcessInfo) bool
+	// HostsSessions is true for a process that runs sessions for all
+	// sessions, not only for the session that started it.
+	HostsSessions(proc *model.ProcessInfo) bool
 	// Label gives a short display name for a process.
 	Label(proc *model.ProcessInfo) string
 	// FileAccessFilter is false for system paths that are noise in the open-files view.

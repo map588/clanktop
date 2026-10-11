@@ -81,6 +81,7 @@ A tree of agents, like the process tree in htop. Under each session are:
 
 - The subagents that it started. A subagent that another subagent started is under that subagent.
 - The background session that it parked its work in.
+- The sessions that its processes started, for example `claude -p` in a Bash call or in a script that starts workers.
 
 A subagent stays in the tree while it runs and for 10 minutes after it stops. A stopped subagent is gray.
 
@@ -124,7 +125,7 @@ Subagents run inside the agent process. They are not separate processes. Each su
 
 ### Processes
 
-clanktop reads the kernel process table with one `sysctl` call (about 0.1 ms) at each poll. It builds one tree for each session. A direct child of the agent that is a shell is a Bash tool call, a hook, or the status line. All other direct children are MCP or language servers. clanktop reads CPU and memory once per second, and the command line of each process one time.
+clanktop reads the kernel process table with one `sysctl` call (about 0.1 ms) at each poll. It builds one tree for each session. A tree stops at a process that is another session. The parent of a session is the nearest ancestor process that is a session. The search stops at the Claude Code daemon (`claude daemon run`): the first session that needs the daemon starts it, but the daemon then hosts the background sessions of all sessions. A direct child of the agent that is a shell is a Bash tool call, a hook, or the status line. All other direct children are MCP or language servers. clanktop reads CPU and memory once per second, and the command line of each process one time.
 
 ### Open files
 

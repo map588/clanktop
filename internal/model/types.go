@@ -122,6 +122,7 @@ type OpenFile struct {
 // AgentView is the state of one session at one time.
 type AgentView struct {
 	Session
+	ParentPID  int32        `json:"parentPid,omitempty"` // Session whose process started this session
 	LogPath    string       `json:"logPath"`
 	Title      string       `json:"title"`
 	LastPrompt string       `json:"lastPrompt"`

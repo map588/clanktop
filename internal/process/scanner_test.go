@@ -27,6 +27,8 @@ var cmdlines = map[int32][]string{
 	103: {"caffeinate", "-i", "-t", "300"},
 	104: {"go", "test", "./..."},
 	301: {"/Users/x/.cargo/bin/tokensave", "serve"},
+	600: {"/Users/x/.local/bin/claude", "daemon", "run", "--origin", "transient"},
+	601: {"claude", "bg-pty-host", "--bg-pty-host", "/tmp/x.sock"},
 }
 
 func procs(pids ...int32) []Proc {
@@ -44,6 +46,12 @@ func procs(pids ...int32) []Proc {
 		// A session hosted by a Claude Code daemon that session 100 started.
 		400: {PID: 400, PPID: 102, Comm: "claude", Start: t0.Add(8 * time.Second)},
 		401: {PID: 401, PPID: 400, Comm: "tokensave", Start: t0.Add(9 * time.Second)},
+		// A session that a Bash tool call of session 100 started (claude -p).
+		500: {PID: 500, PPID: 104, Comm: "claude", Start: t0.Add(10 * time.Second)},
+		// The Claude Code daemon that session 100 started, and a session it hosts.
+		600: {PID: 600, PPID: 100, Comm: "claude", Start: t0.Add(11 * time.Second)},
+		601: {PID: 601, PPID: 600, Comm: "claude", Start: t0.Add(12 * time.Second)},
+		602: {PID: 602, PPID: 601, Comm: "claude", Start: t0.Add(13 * time.Second)},
 	}
 	var out []Proc
 	for _, p := range pids {
@@ -62,7 +70,7 @@ func names(n *model.ProcessInfo) []string {
 
 func TestScanBuildsOneTreePerSession(t *testing.T) {
 	s, reads := newTestScanner(cmdlines)
-	trees, news := s.Scan(procs(1, 100, 101, 102, 103, 104, 200, 300, 301), []int32{100, 300, 999}, t0)
+	trees, news, _ := s.Scan(procs(1, 100, 101, 102, 103, 104, 200, 300, 301), []int32{100, 300, 999}, t0)
 
 	if len(trees) != 2 || trees[999] != nil {
 		t.Fatalf("got %d trees", len(trees))
@@ -96,7 +104,7 @@ func TestScanBuildsOneTreePerSession(t *testing.T) {
 
 	// A second scan reads no cmdline again, also not for the hidden
 	// caffeinate. It counts the one new process.
-	_, news = s.Scan(procs(1, 100, 101, 102, 103, 104, 105, 200, 300, 301), []int32{100, 300}, t0.Add(100*time.Millisecond))
+	_, news, _ = s.Scan(procs(1, 100, 101, 102, 103, 104, 105, 200, 300, 301), []int32{100, 300}, t0.Add(100*time.Millisecond))
 	if *reads != 6 || news[100] != 1 || news[300] != 0 {
 		t.Fatalf("second scan: reads %d news %v", *reads, news)
 	}
@@ -104,7 +112,7 @@ func TestScanBuildsOneTreePerSession(t *testing.T) {
 
 func TestNestedSessionHasItsOwnTree(t *testing.T) {
 	s, _ := newTestScanner(cmdlines)
-	trees, _ := s.Scan(procs(1, 100, 102, 400, 401), []int32{100, 400}, t0)
+	trees, _, _ := s.Scan(procs(1, 100, 102, 400, 401), []int32{100, 400}, t0)
 	if mcp := trees[100].Children[0]; len(mcp.Children) != 0 {
 		t.Fatalf("session 400 is inside the tree of session 100: %+v", mcp.Children[0])
 	}
@@ -115,10 +123,10 @@ func TestNestedSessionHasItsOwnTree(t *testing.T) {
 
 func TestExitedProcessStaysForRetention(t *testing.T) {
 	s, _ := newTestScanner(cmdlines)
-	s.Scan(procs(1, 100, 101, 102, 104), []int32{100}, t0)
+	_, _, _ = s.Scan(procs(1, 100, 101, 102, 104), []int32{100}, t0)
 
 	// The Bash tool and its child exit.
-	trees, _ := s.Scan(procs(1, 100, 102), []int32{100}, t0.Add(time.Second))
+	trees, _, _ := s.Scan(procs(1, 100, 102), []int32{100}, t0.Add(time.Second))
 	a := trees[100]
 	if len(a.Children) != 2 {
 		t.Fatalf("children %v", names(a))
@@ -128,7 +136,7 @@ func TestExitedProcessStaysForRetention(t *testing.T) {
 		t.Fatalf("exited bash: %+v", bash)
 	}
 
-	trees, _ = s.Scan(procs(1, 100, 102), []int32{100}, t0.Add(ExitedRetention+2*time.Second))
+	trees, _, _ = s.Scan(procs(1, 100, 102), []int32{100}, t0.Add(ExitedRetention+2*time.Second))
 	if got := names(trees[100]); len(got) != 1 {
 		t.Fatalf("exited processes must go after retention: %v", got)
 	}
@@ -148,4 +156,16 @@ func TestListProcsFindsSelf(t *testing.T) {
 		}
 	}
 	t.Fatal("own PID not in process table")
+}
+
+// A session that a process of another session started is the child of that
+// session. The walk up the process tree stops at the Claude Code daemon: it
+// hosts background sessions for all sessions, not only for the one that
+// started it.
+func TestSessionParents(t *testing.T) {
+	s, _ := newTestScanner(cmdlines)
+	_, _, parents := s.Scan(procs(1, 100, 101, 104, 500, 600, 601, 602), []int32{100, 500, 602}, t0)
+	if len(parents) != 1 || parents[500] != 100 {
+		t.Fatalf("parents %v, want map[500:100]", parents)
+	}
 }

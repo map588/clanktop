@@ -117,6 +117,24 @@ func TestClassifyChildAndLabel(t *testing.T) {
 	}
 }
 
+func TestHostsSessions(t *testing.T) {
+	cc := NewClaudeCode("")
+	tests := []struct {
+		cmdline []string
+		want    bool
+	}{
+		{[]string{"/Users/x/.local/bin/claude", "daemon", "run", "--origin", "transient"}, true},
+		{[]string{"claude", "bg-pty-host", "--bg-pty-host", "/tmp/x.sock"}, false},
+		{[]string{"claude", "-p", "daemon"}, false},
+		{[]string{"claude"}, false},
+	}
+	for _, tt := range tests {
+		if got := cc.HostsSessions(&model.ProcessInfo{Cmdline: tt.cmdline}); got != tt.want {
+			t.Errorf("HostsSessions(%v) = %v, want %v", tt.cmdline, got, tt.want)
+		}
+	}
+}
+
 func TestFileAccessFilter(t *testing.T) {
 	cc := NewClaudeCode("")
 	tests := []struct {

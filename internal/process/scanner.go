@@ -90,8 +90,9 @@ func NewScanner(be backend.ClientBackend) *Scanner {
 }
 
 // Scan builds the tree of each root PID. It also returns the number of
-// processes in each tree that the previous scan did not see.
-func (s *Scanner) Scan(procs []Proc, roots []int32, now time.Time) (map[int32]*model.ProcessInfo, map[int32]int) {
+// processes in each tree that the previous scan did not see, and for each
+// root that a process of another root started, that other root.
+func (s *Scanner) Scan(procs []Proc, roots []int32, now time.Time) (trees map[int32]*model.ProcessInfo, newCount map[int32]int, parents map[int32]int32) {
 	byPID := make(map[int32]Proc, len(procs))
 	kids := make(map[int32][]Proc)
 	for _, p := range procs {
@@ -101,8 +102,8 @@ func (s *Scanner) Scan(procs []Proc, roots []int32, now time.Time) (map[int32]*m
 		}
 	}
 
-	trees := map[int32]*model.ProcessInfo{}
-	newCount := map[int32]int{}
+	trees = map[int32]*model.ProcessInfo{}
+	newCount = map[int32]int{}
 	cur := map[int32]int32{}
 	nodes := map[int32]*model.ProcessInfo{}
 	isRoot := map[int32]bool{}
@@ -140,8 +141,8 @@ func (s *Scanner) Scan(procs []Proc, roots []int32, now time.Time) (map[int32]*m
 			newCount[root]++
 		}
 		for _, k := range kids[p.PID] {
-			// A session can start the Claude Code daemon, which hosts other
-			// sessions. Each session has its own tree.
+			// A session can start another session, directly (claude -p) or
+			// through the Claude Code daemon. Each session has its own tree.
 			if isRoot[k.PID] {
 				continue
 			}
@@ -178,7 +179,31 @@ func (s *Scanner) Scan(procs []Proc, roots []int32, now time.Time) (map[int32]*m
 		}
 	}
 	s.prev, s.nodes = cur, nodes
-	return trees, newCount
+	return trees, newCount, s.parents(byPID, nodes, isRoot)
+}
+
+// parents finds, for each root, the nearest ancestor process that is another
+// root. The walk stops at a process that hosts sessions for all sessions
+// (the Claude Code daemon): the session that started the daemon did not start
+// the sessions in it.
+func (s *Scanner) parents(byPID map[int32]Proc, nodes map[int32]*model.ProcessInfo, isRoot map[int32]bool) map[int32]int32 {
+	out := map[int32]int32{}
+	for r := range isRoot {
+		p, ok := byPID[r]
+		for steps := 0; ok && steps < len(byPID); steps++ {
+			if p, ok = byPID[p.PPID]; !ok || p.PID <= 1 {
+				break
+			}
+			if isRoot[p.PID] {
+				out[r] = p.PID
+				break
+			}
+			if n := nodes[p.PID]; n != nil && s.be.HostsSessions(n) {
+				break
+			}
+		}
+	}
+	return out
 }
 
 // attachExited adds each exited process under its parent: a live process, an

@@ -31,6 +31,7 @@ type Collector struct {
 
 type session struct {
 	info   model.Session
+	parent int32 // Session whose process started this session, or 0
 	main   *agentLog
 	subs   map[string]*agentLog // By log path
 	tree   *model.ProcessInfo
@@ -205,9 +206,10 @@ func (c *Collector) PollProcs(now time.Time) {
 	for pid := range c.sessions {
 		roots = append(roots, pid)
 	}
-	trees, news := c.scanner.Scan(procs, roots, now)
+	trees, news, parents := c.scanner.Scan(procs, roots, now)
 	for pid, s := range c.sessions {
 		s.tree = trees[pid]
+		s.parent = parents[pid]
 		s.alerts = nil
 		if s.tree != nil {
 			s.alerts = s.leak.Check(s.tree, news[pid], now)
@@ -279,6 +281,7 @@ func (c *Collector) Snapshot(now time.Time) []model.AgentView {
 	for _, s := range c.sessions {
 		v := model.AgentView{
 			Session:   s.info,
+			ParentPID: s.parent,
 			Tree:      s.tree,
 			OpenFiles: slices.Clone(s.open),
 			Alerts:    slices.Clone(s.alerts),

@@ -119,6 +119,8 @@ func TestRosterTree(t *testing.T) {
 		}},
 		{Session: model.Session{PID: 200, Name: "b", Kind: "bg", JobID: "j1"}},
 		{Session: model.Session{PID: 300, Name: "c"}},
+		// A session that a process of session 300 started (claude -p).
+		{Session: model.Session{PID: 400, Name: "d"}, ParentPID: 300},
 	}
 	var got []string
 	for _, r := range m.rows() {
@@ -131,6 +133,7 @@ func TestRosterTree(t *testing.T) {
 		"├─ 100/r1",
 		"└─ 200",
 		"300",
+		"└─ 400",
 	}
 	if strings.Join(got, "\n") != strings.Join(want, "\n") {
 		t.Fatalf("got\n%s\nwant\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))

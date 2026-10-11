@@ -170,21 +170,30 @@ type row struct {
 }
 
 // rows builds the roster tree. Under a session are the subagents that it
-// started, each under the subagent whose Agent call started it, and then the
-// background session that it parked its work in.
+// started, each under the subagent whose Agent call started it, then the
+// background session that it parked its work in, then the sessions that its
+// processes started (for example claude -p in a Bash call).
 func (m *Model) rows() []row {
 	byJob := map[string]*model.AgentView{}
+	byPID := map[int32]*model.AgentView{}
 	for i := range m.views {
-		if j := m.views[i].JobID; j != "" {
-			byJob[j] = &m.views[i]
+		v := &m.views[i]
+		byPID[v.PID] = v
+		if v.JobID != "" {
+			byJob[v.JobID] = v
 		}
 	}
 	parkedIn := map[*model.AgentView]*model.AgentView{}
-	isParked := map[*model.AgentView]bool{}
+	started := map[*model.AgentView][]*model.AgentView{}
+	isChild := map[*model.AgentView]bool{}
 	for i := range m.views {
 		v := &m.views[i]
 		if p := byJob[v.ParkedJobID]; v.ParkedJobID != "" && p != nil && p != v {
-			parkedIn[v], isParked[p] = p, true
+			parkedIn[v], isChild[p] = p, true
+		}
+		if p := byPID[v.ParentPID]; v.ParentPID != 0 && p != nil && p != v {
+			started[p] = append(started[p], v)
+			isChild[v] = true
 		}
 	}
 
@@ -233,14 +242,17 @@ func (m *Model) rows() []row {
 		if p := parkedIn[v]; p != nil {
 			kids = append(kids, node{sess: p})
 		}
+		for _, c := range started[v] {
+			kids = append(kids, node{sess: c})
+		}
 		addChildren(v, kids, indent)
 	}
 	for i := range m.views {
-		if !isParked[&m.views[i]] {
+		if !isChild[&m.views[i]] {
 			addSession(&m.views[i], "", "")
 		}
 	}
-	// A cycle of parked sessions has no top. Show such sessions at the top level.
+	// A cycle of parent links has no top. Show such sessions at the top level.
 	for i := range m.views {
 		addSession(&m.views[i], "", "")
 	}

@@ -4,117 +4,44 @@ import (
 	"testing"
 	"time"
 
-	"github.com/map588/clanktop/internal/bus"
 	"github.com/map588/clanktop/internal/model"
 )
 
-func TestCheckZombies_NoAlert(t *testing.T) {
-	eb := bus.New()
-	defer eb.Shutdown()
-	ld := NewLeakDetector(eb)
-
-	tree := &model.ProcessInfo{
-		PID:   1,
-		State: "running",
-		Children: []*model.ProcessInfo{
-			{PID: 2, State: "zombie"},
-			{PID: 3, State: "running"},
-		},
+func treeWith(n int, role model.ProcessRole, state string) *model.ProcessInfo {
+	root := &model.ProcessInfo{PID: 1, Role: model.RoleOrchestrator}
+	for i := range n {
+		root.Children = append(root.Children, &model.ProcessInfo{PID: int32(i + 2), Role: role, State: state})
 	}
-
-	ld.checkZombies(tree)
-
-	select {
-	case <-eb.Alerts:
-		t.Fatal("should not alert for 1 zombie (threshold is 5)")
-	default:
-	}
+	return root
 }
 
-func TestCheckZombies_Alert(t *testing.T) {
-	eb := bus.New()
-	defer eb.Shutdown()
-	ld := NewLeakDetector(eb)
-
-	children := make([]*model.ProcessInfo, 6)
-	for i := range children {
-		children[i] = &model.ProcessInfo{PID: int32(i + 2), State: "zombie"}
+func TestLeakDetector(t *testing.T) {
+	now := time.Now()
+	tests := []struct {
+		name   string
+		tree   *model.ProcessInfo
+		newPID int
+		want   int
+	}{
+		{"one zombie is fine", treeWith(1, model.RoleToolProcess, "Z"), 0, 0},
+		{"six zombies alert", treeWith(6, model.RoleMCPServer, "Z"), 0, 1},
+		{"ten shells is fine", treeWith(10, model.RoleToolProcess, ""), 0, 0},
+		{"eleven shells alert", treeWith(11, model.RoleToolProcess, ""), 0, 1},
+		{"fifty spawns in one check alert", treeWith(0, 0, ""), 51, 1},
 	}
-	tree := &model.ProcessInfo{PID: 1, State: "running", Children: children}
-
-	ld.checkZombies(tree)
-
-	select {
-	case alert := <-eb.Alerts:
-		if alert.Severity != "warning" {
-			t.Errorf("expected warning severity, got %s", alert.Severity)
+	for _, tt := range tests {
+		var ld LeakDetector
+		if got := ld.Check(tt.tree, tt.newPID, now); len(got) != tt.want {
+			t.Errorf("%s: got alerts %v, want %d", tt.name, got, tt.want)
 		}
-	default:
-		t.Fatal("expected alert for 6 zombies")
 	}
 }
 
-func TestCheckShellAccumulation(t *testing.T) {
-	eb := bus.New()
-	defer eb.Shutdown()
-	ld := NewLeakDetector(eb)
-
-	shells := make([]*model.ProcessInfo, 11)
-	for i := range shells {
-		shells[i] = &model.ProcessInfo{PID: int32(i + 10), Name: "sh", State: "running"}
+func TestSpawnWindowExpires(t *testing.T) {
+	var ld LeakDetector
+	now := time.Now()
+	ld.Check(treeWith(0, 0, ""), 60, now)
+	if got := ld.Check(treeWith(0, 0, ""), 0, now.Add(SpawnRateWindow+time.Second)); len(got) != 0 {
+		t.Fatalf("old spawns must expire: %v", got)
 	}
-	tree := &model.ProcessInfo{
-		PID:      1,
-		Role:     model.RoleOrchestrator,
-		Children: shells,
-	}
-
-	ld.checkShellAccumulation(tree)
-
-	select {
-	case <-eb.Alerts:
-		// expected
-	default:
-		t.Fatal("expected shell accumulation alert for 11 shells")
-	}
-}
-
-func TestCheckSpawnRate_NoAlert(t *testing.T) {
-	eb := bus.New()
-	defer eb.Shutdown()
-	ld := NewLeakDetector(eb)
-
-	ld.checkSpawnRate([]int32{1, 2, 3})
-
-	select {
-	case <-eb.Alerts:
-		t.Fatal("should not alert for 3 spawns")
-	default:
-	}
-}
-
-func TestCheckSpawnRate_Alert(t *testing.T) {
-	eb := bus.New()
-	defer eb.Shutdown()
-	ld := NewLeakDetector(eb)
-
-	// Simulate 60 spawns in quick succession (>10/s over 5s)
-	pids := make([]int32, 60)
-	for i := range pids {
-		pids[i] = int32(i)
-	}
-	ld.checkSpawnRate(pids)
-
-	// Need to wait briefly or use the same timestamp
-	// The timestamps are all "now" so rate = 60/5 = 12/s
-	select {
-	case alert := <-eb.Alerts:
-		if alert.Severity != "critical" {
-			t.Errorf("expected critical severity, got %s", alert.Severity)
-		}
-	default:
-		t.Fatal("expected spawn rate alert for 60 spawns in 5s window")
-	}
-
-	_ = time.Now() // suppress import
 }

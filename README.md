@@ -1,26 +1,26 @@
 # clanktop
 
-A terminal-based real-time process observer for your clankers. Watch what your clanker is actually doing at the OS level, which processes it spawns, what files it touches, how deep the agent hierarchy goes, and whether anything is leaking.
+A terminal monitor for the AI coding agents that run on your machine. It shows every live Claude Code session, its subagents, the tool calls each agent makes, the files each agent touches, and the processes that each session starts.
 
-Built for debugging [Claude Code](https://claude.ai/code) sessions, but designed to support other clients in the future.
+Built for [Claude Code](https://claude.ai/code). The backend interface can support other clients later.
 
 ## Why
 
-When an clanker runs on your machine, it spawns shells, reads files, invokes tools, and sometimes creates process trees several levels deep. There is no easy way to see this activity in real time. 
-`clanktop` enables this.
+An agent on your machine runs shell commands, reads and edits files, starts MCP servers, and starts subagents. Usually more than one agent runs at the same time. clanktop shows all of them in one screen.
 
-**What clanktop can help find:**
+**What clanktop shows:**
 
-- What processes is my agent spawning right now?
-- What files is it reading and writing?
-- Which MCP servers are running and consuming memory?
-- Is something leaking processes or accumulating zombies?
-- What tool calls is the agent making, and with what arguments?
-- Which config/prompt files did it load?
+- Which Claude Code sessions run now, which are busy, and what each one does at this moment
+- Which subagents each session started, and whether they still run
+- Each tool call with its arguments, its duration, and whether it failed
+- Which files each agent read, wrote, edited, or searched
+- Which files the processes of a session hold open now (MCP servers, language servers, test runners)
+- Which processes each session started, with CPU and memory, and leak alerts
+- Which prompt and config files apply to a session
 
 ## Installation
 
-Requires Go 1.22+ and macOS (Apple Silicon or Intel).
+Requires Go 1.26+ and macOS (Apple Silicon or Intel).
 
 ```bash
 git clone https://github.com/map588/clanktop.git
@@ -28,13 +28,13 @@ cd clanktop
 go build -o clanktop ./cmd/clanktop/
 ```
 
-Optionally install to your PATH:
+To install it on your PATH:
 
 ```bash
 go install ./cmd/clanktop/
 ```
 
-Or build with version info:
+To build with version information:
 
 ```bash
 go build -ldflags="-X main.version=$(git describe --tags --always)" -o clanktop ./cmd/clanktop/
@@ -42,128 +42,95 @@ go build -ldflags="-X main.version=$(git describe --tags --always)" -o clanktop 
 
 ## Usage
 
-### Basic
-
-Start clanktop while a Claude Code session is running in another terminal:
+Start clanktop in a terminal:
 
 ```bash
 ./clanktop
 ```
 
-It auto-detects the Claude Code process and attaches. If none is running, it waits.
+clanktop finds all live Claude Code sessions. It needs no PID and no root access. When no session runs, it waits and shows sessions as they start.
 
 ### Options
 
 ```
---pid <PID>             Attach to a specific process instead of auto-detecting
---poll-interval <dur>   Process polling interval (default: 20ms)
+--pid <PID>             Show only the session of this agent process
+--poll-interval <dur>   Process tree poll interval (default: 100ms)
 --no-color              Disable colors
---dump                  Print a single JSON snapshot to stdout and exit
+--dump                  Print one JSON snapshot of all sessions to stdout and exit
 --version               Print version and exit
 ```
 
-### Keyboard Controls
+### Keys
 
 | Key | Action |
 |-----|--------|
-| `Tab` / `Shift+Tab` | Cycle focus between panels |
-| `Up` / `Down` / `j` / `k` | Move cursor within focused panel |
-| `Enter` | Show detail view (or open file in `$EDITOR` for config panel) |
-| `Esc` | Close detail/help overlay |
-| `p` | Pause/resume display |
+| `Tab` / `Shift+Tab` | Change the focused panel |
+| `Up` / `Down` / `j` / `k` | Select an agent (Agents panel) or a line (other panels) |
+| `Enter` | Show the details of the selected line |
+| `e` | Open the selected file in `$EDITOR` |
+| `c` | Show the prompt and config files of the selected session |
+| `p` | Pause or resume |
+| `?` | Help |
 | `q` / `Ctrl+C` | Quit |
-| `?` | Help overlay |
 
 ## Panels
 
-### Agent Tree (top left)
+### Agents (left)
 
-Hierarchical view of all processes under the AI agent. Shows:
+One line for each session, and one line for each subagent that runs or ran in the last 10 minutes.
 
-- Process name, PID, and memory usage
-- Color-coded roles: orchestrator (white bold), MCP servers (yellow), tool processes (green)
-- Exited processes with `[exited]` tag stay visible for session history
-- Shell wrappers annotated with the actual command from Claude Code's logs (e.g. `sleep 3 && echo "done"` instead of `zsh`)
+- `●` busy, `○` idle or other status, from the session registry
+- The session name, `bg` for a background session, and the tool call that runs now with its elapsed time
+- `⚠` when the session has an alert
 
-The tree is **append-only**: processes are added chronologically and never reordered, so the display is stable even during heavy tool use.
+The other panels show the selected agent. When you select a session, the Files panel also includes the files of its subagents.
 
-### Config & Prompts (top right)
+### Activity (top right)
 
-Lists all prompt and configuration files discovered at startup:
+The tool calls of the selected agent, the newest first: start time, tool, duration, and a summary of the arguments. `▶` marks a call that runs now. `✗` marks a call that failed. Press `Enter` to see the full input of a call.
 
-- `~/.claude/CLAUDE.md`, `~/.claude/settings.json`
-- Project-level `CLAUDE.md`, `.cursorrules`
-- Project-specific config in `~/.claude/projects/<project>/`
+### Files touched · open (bottom middle)
 
-Shows modification age for each file. Press `Enter` to open the selected file in `$EDITOR`.
+The files that the agent touched, the most recent first:
 
-### Live Tool Calls (middle)
+- `R` read, `W` write, `E` edit, `S` search (the `path` of a Grep or Glob call)
+- The number of calls on the file, and the time since the last call
+- Write and edit lines are red
 
-Real-time feed of tool invocations from Claude Code's session log (JSONL). Shows:
+Under the separator are the files that the processes of the session hold open now, at most five for each process.
 
-- Timestamp, tool name, and arguments
-- Bash commands, Agent spawns, MCP tool calls
-- File operations (Read, Write, Edit, Grep, Glob) are routed to the File Activity panel instead
+### Processes (bottom right)
 
-Latest calls appear at top. Scroll with arrow keys when focused.
-
-### Process Stats (bottom left)
-
-Aggregate counters:
-
-- Total, running, sleeping, zombie, and exited process counts
-- Total CPU% and RSS memory across the agent tree
-- Process spawn rate (per second)
-- Leak detection alerts (zombie accumulation, shell accumulation, runaway spawn rate)
-
-### File Activity (bottom right)
-
-Deduplicated list of files the agent has accessed, with operation tags:
-
-- `[R]` Read, `[W]` Write, `[E]` Edit, `[G]` Grep, `[F]` Glob (Find)
-- Tags accumulate, a file that was read then edited shows `[RE]`
-- Write/Edit operations highlighted in red, read-only in green
-- Sorted by most recent activity
+The process tree of the session: MCP and language servers (yellow), Bash tool commands (green, with the command as the label), CPU, and memory. A process that exited stays in the tree for 60 seconds. Leak alerts show at the top: zombie accumulation, shell accumulation, and runaway spawn rate.
 
 ## How It Works
 
-### Process Detection
+clanktop reads files that Claude Code writes for its own use. They are not a public interface. A Claude Code update can change them. In that case clanktop shows an alert, not an empty screen: "No session log found" or "Session log format not recognized". After a Claude Code update, run `clanktop --dump` once to check that your sessions still appear.
 
-clanktop polls the OS process table every 20ms using a single `ps -eo pid,ppid,rss,comm` call (~2ms per invocation). This catches any process that lives longer than 20ms. Shorter processes are still visible through JSONL log tailing.
+### Sessions
 
-### Tool Call Tracking
+Claude Code writes one file for each live session to `~/.claude/sessions/<pid>.json`: the session ID, the working directory, the kind (interactive or bg), the status (busy or idle), and the name. clanktop reads this directory every second. It does not read the `*.key` files in this directory.
 
-Claude Code writes every tool invocation to a JSONL session log at `~/.claude/projects/<project>/<session-id>.jsonl`. clanktop tails this file and extracts structured tool calls with full arguments. This is the primary data source, it captures everything regardless of process lifetime.
+### Tool calls and files
 
-### MCP Server Detection
+Each session writes a JSONL log to `~/.claude/projects/<project>/<session-id>.jsonl`. clanktop reads the full log when it starts and then reads new lines every 500 ms. It pairs each `tool_use` record with its `tool_result` record to get the duration and the error status. The file operations come from the arguments of the Read, Write, Edit, MultiEdit, NotebookEdit, Grep, and Glob calls.
 
-MCP servers are identified by reading Claude Code's configuration from `~/.claude.json` and project-level `.mcp.json`. The configured command names are matched against running processes. Common launchers (`npx`, `uvx`, `node`) are handled by also checking the first argument.
+Subagents run inside the agent process. They are not separate processes. Each subagent writes its own log to `<project>/<session-id>/subagents/agent-<id>.jsonl`, with a `.meta.json` file that gives its type and description.
 
-### Stable Tree
+### Processes
 
-The TUI maintains an append-only tree structure. New processes are added as children of their parent; exited processes are marked but never removed or reordered. This prevents the tree from flickering during heavy activity and preserves a chronological record of what the agent did.
+clanktop reads the kernel process table with one `sysctl` call (about 0.1 ms) at each poll. It builds one tree for each session. A direct child of the agent that is a shell is a Bash tool call, a hook, or the status line. All other direct children are MCP or language servers. clanktop reads CPU and memory once per second, and the command line of each process one time.
 
-### Shell Annotation
+### Open files
 
-Claude Code runs commands through shell wrappers (`zsh -c "source snapshot.sh && eval 'actual command'"`). clanktop cross-references the JSONL Bash tool calls with spawned shell processes to annotate tree nodes with the actual command being run.
-
-## Debug Build
-
-Build with debug logging enabled:
-
-```bash
-go build -tags debug -o clanktop-debug ./cmd/clanktop/
-```
-
-Debug output writes to `/tmp/clanktop-debug.log` and includes scanner ticks, process detection events, and tree merge operations.
+Claude Code opens and closes each file within milliseconds, so the agent process itself holds no project files open. clanktop runs `lsof` on the processes of each session every 2 seconds. This shows the files that servers and test runners keep open.
 
 ## Limitations
 
-- **macOS only**: uses `ps` command and gopsutil's libproc wrappers. Linux support is feasible but untested.
-- **No elevated privileges**: kqueue `EVFILT_PROC` is blocked by SIP on macOS, so we use fast polling instead of event-driven process monitoring.
-- **Sub-20ms processes**: processes that spawn and exit within a single poll interval are only visible through JSONL log data, not in the process tree.
-- **Claude Code only**: the backend interface supports other clients, but only Claude Code is implemented.
-- **No network inspection**: does not monitor API calls, token usage, or network traffic.
+- **macOS only.** clanktop uses `sysctl kern.proc.all`, `proc_pidinfo` (through gopsutil), and `lsof`.
+- **Claude Code only.** The backend interface can support other clients, but only Claude Code is implemented.
+- **Private file formats.** See "How It Works".
+- **No network inspection.** clanktop does not monitor API calls, token usage, or network traffic.
 
 ## License
 

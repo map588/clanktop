@@ -1,142 +1,65 @@
+// Package filetracker finds the prompt and config files that Claude Code loads.
 package filetracker
 
 import (
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 	"time"
-
-	"github.com/map588/clanktop/internal/model"
 )
 
-// Known Claude Code config/prompt file locations, in typical load order.
-// Paths are relative to home dir unless absolute.
-var knownPromptPaths = []string{
-	// Global
+// PromptFile is a prompt or config file and its modification time.
+type PromptFile struct {
+	Path    string
+	ModTime time.Time
+}
+
+// Global files, relative to the home directory.
+var globalPromptFiles = []string{
 	".claude/CLAUDE.md",
 	".claude/settings.json",
 	".claude/settings.local.json",
+	".claude/rules/*.md",
 }
 
-// Project-relative prompt files
+// Project files, relative to the session cwd.
 var projectPromptFiles = []string{
 	"CLAUDE.md",
+	"CLAUDE.local.md",
 	".claude/CLAUDE.md",
 	".claude/settings.json",
 	".claude/settings.local.json",
-	".cursorrules",
-	".github/copilot-instructions.md",
+	".mcp.json",
 }
 
-// ScanPromptFiles discovers prompt/config files by checking known paths.
-// Returns files sorted by modification time (proxy for load order).
-func ScanPromptFiles(projectDir string) []model.FileEvent {
-	home, _ := os.UserHomeDir()
-	sessionStart := time.Now()
-
-	var files []model.FileEvent
-
-	// Global files
-	for _, rel := range knownPromptPaths {
-		path := filepath.Join(home, rel)
-		if info, err := os.Stat(path); err == nil {
-			files = append(files, model.FileEvent{
-				Timestamp:  info.ModTime(),
-				Path:       path,
-				Operation:  model.FileOpRead,
-				Source:     "scan",
-			})
-		}
-	}
-
-	// Project-specific claude config dir
+// ScanPromptFiles finds the prompt and config files of a session. projectDir
+// is the directory of the session log; its memory/ directory holds the
+// project memory files. The most recently modified file is first.
+func ScanPromptFiles(home, cwd, projectDir string) []PromptFile {
+	var patterns []string
 	if home != "" {
-		// Project memory dir: ~/.claude/projects/<encoded-path>/
-		projConfigDir := findProjectConfigDir(home, projectDir)
-		if projConfigDir != "" {
-			scanDir(projConfigDir, &files)
+		for _, p := range globalPromptFiles {
+			patterns = append(patterns, filepath.Join(home, p))
 		}
 	}
-
-	// Project-relative files
+	if cwd != "" {
+		for _, p := range projectPromptFiles {
+			patterns = append(patterns, filepath.Join(cwd, p))
+		}
+	}
 	if projectDir != "" {
-		for _, rel := range projectPromptFiles {
-			path := filepath.Join(projectDir, rel)
-			if info, err := os.Stat(path); err == nil {
-				files = append(files, model.FileEvent{
-					Timestamp:  info.ModTime(),
-					Path:       path,
-					Operation:  model.FileOpRead,
-					Source:     "scan",
-				})
+		patterns = append(patterns, filepath.Join(projectDir, "memory", "*.md"))
+	}
+
+	var files []PromptFile
+	for _, pattern := range patterns {
+		matches, _ := filepath.Glob(pattern)
+		for _, path := range matches {
+			if info, err := os.Stat(path); err == nil && !info.IsDir() {
+				files = append(files, PromptFile{Path: path, ModTime: info.ModTime()})
 			}
 		}
 	}
-
-	// Sort by mod time
-	sort.Slice(files, func(i, j int) bool {
-		return files[i].Timestamp.Before(files[j].Timestamp)
-	})
-
-	// Normalize timestamps relative to session
-	_ = sessionStart
+	slices.SortFunc(files, func(a, b PromptFile) int { return b.ModTime.Compare(a.ModTime) })
 	return files
-}
-
-// findProjectConfigDir locates ~/.claude/projects/<encoded-path>/ for given project dir.
-func findProjectConfigDir(home, projectDir string) string {
-	if projectDir == "" {
-		return ""
-	}
-	projectsDir := filepath.Join(home, ".claude", "projects")
-	entries, err := os.ReadDir(projectsDir)
-	if err != nil {
-		return ""
-	}
-
-	// Claude encodes path by replacing / with -
-	// e.g., /Users/matthewprock/git/clanktop -> -Users-matthewprock-git-clanktop
-	encoded := encodePath(projectDir)
-	for _, e := range entries {
-		if e.IsDir() && e.Name() == encoded {
-			return filepath.Join(projectsDir, e.Name())
-		}
-	}
-	return ""
-}
-
-func encodePath(path string) string {
-	// Replace path separators with dashes, matching Claude Code's encoding
-	result := make([]byte, 0, len(path))
-	for _, c := range []byte(path) {
-		if c == '/' {
-			result = append(result, '-')
-		} else {
-			result = append(result, c)
-		}
-	}
-	return string(result)
-}
-
-func scanDir(dir string, files *[]model.FileEvent) {
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return
-	}
-	for _, e := range entries {
-		if e.IsDir() {
-			continue
-		}
-		path := filepath.Join(dir, e.Name())
-		info, err := os.Stat(path)
-		if err != nil {
-			continue
-		}
-		*files = append(*files, model.FileEvent{
-			Timestamp: info.ModTime(),
-			Path:      path,
-			Operation: model.FileOpRead,
-			Source:    "scan",
-		})
-	}
 }

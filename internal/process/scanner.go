@@ -1,282 +1,257 @@
+// Package process builds the process tree of each agent session.
 package process
 
 import (
-	"context"
-	"fmt"
-	"path/filepath"
+	"slices"
 	"time"
 
-	"github.com/map588/clanktop/internal/debug"
+	gopsutil "github.com/shirou/gopsutil/v3/process"
+	"golang.org/x/sys/unix"
 
-	"github.com/shirou/gopsutil/v3/process"
-
-	"github.com/map588/clanktop/internal/bus"
+	"github.com/map588/clanktop/internal/backend"
 	"github.com/map588/clanktop/internal/model"
 )
 
-const (
-	DefaultSnapshotHistory = 60
-	ExitedRetention        = 5 * time.Minute
-)
+// ExitedRetention is how long the tree keeps a process after it exits.
+const ExitedRetention = 60 * time.Second
 
+// Proc is one entry of the kernel process table.
+type Proc struct {
+	PID, PPID int32
+	State     string // Z (zombie), T (stopped), or "" (macOS p_stat does not tell running from sleeping)
+	Comm      string // Executable name, truncated to 16 bytes by the kernel
+	Start     time.Time
+}
+
+// ListProcs reads the process table with one sysctl call. It does not fork,
+// so it is cheap enough to call every 100 ms.
+func ListProcs() ([]Proc, error) {
+	kps, err := unix.SysctlKinfoProcSlice("kern.proc.all")
+	if err != nil {
+		return nil, err
+	}
+	out := make([]Proc, 0, len(kps))
+	for _, k := range kps {
+		state := ""
+		switch k.Proc.P_stat {
+		case 4: // SSTOP
+			state = "T"
+		case 5: // SZOMB
+			state = "Z"
+		}
+		out = append(out, Proc{
+			PID:   k.Proc.P_pid,
+			PPID:  k.Eproc.Ppid,
+			State: state,
+			Comm:  unix.ByteSliceToString(k.Proc.P_comm[:]),
+			Start: time.Unix(k.Proc.P_starttime.Sec, int64(k.Proc.P_starttime.Usec)*1000),
+		})
+	}
+	return out, nil
+}
+
+// procInfo is what the scanner remembers about a live process in a tree.
+type procInfo struct {
+	start   time.Time
+	cmdline []string
+	cpuTime float64 // User + system seconds at the last sample
+	sampled time.Time
+	cpuPct  float64
+	rss     uint64
+}
+
+type exitedProc struct {
+	node *model.ProcessInfo
+	root int32
+}
+
+// Scanner builds one process tree per session from successive process tables.
 type Scanner struct {
-	rootPID      int32
-	interval     time.Duration
-	eventBus     *bus.EventBus
-	snapshots    *model.RingBuffer[*model.ProcessInfo]
-	prevPIDs     map[int32]struct{}
-	prevProcs    map[int32]*model.ProcessInfo // full info from last tick
-	exitedProcs  map[int32]*model.ProcessInfo // PID -> exited process with full info
+	be      backend.ClientBackend
+	info    map[int32]*procInfo
+	prev    map[int32]int32 // PID -> root PID, for the processes of the last scan
+	nodes   map[int32]*model.ProcessInfo
+	exited  map[int32]*exitedProc
+	cmdline func(pid int32) []string // Replaced in tests
 }
 
-func NewScanner(rootPID int32, interval time.Duration, eventBus *bus.EventBus) *Scanner {
+func NewScanner(be backend.ClientBackend) *Scanner {
 	return &Scanner{
-		rootPID:     rootPID,
-		interval:    interval,
-		eventBus:    eventBus,
-		snapshots:   model.NewRingBuffer[*model.ProcessInfo](DefaultSnapshotHistory),
-		prevPIDs:    make(map[int32]struct{}),
-		prevProcs:   make(map[int32]*model.ProcessInfo),
-		exitedProcs: make(map[int32]*model.ProcessInfo),
+		be:     be,
+		info:   map[int32]*procInfo{},
+		prev:   map[int32]int32{},
+		nodes:  map[int32]*model.ProcessInfo{},
+		exited: map[int32]*exitedProc{},
+		cmdline: func(pid int32) []string {
+			c, _ := (&gopsutil.Process{Pid: pid}).CmdlineSlice()
+			return c
+		},
 	}
 }
 
-func (s *Scanner) Run(ctx context.Context) {
-	ticker := time.NewTicker(s.interval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			s.tick()
+// Scan builds the tree of each root PID. It also returns the number of
+// processes in each tree that the previous scan did not see.
+func (s *Scanner) Scan(procs []Proc, roots []int32, now time.Time) (map[int32]*model.ProcessInfo, map[int32]int) {
+	byPID := make(map[int32]Proc, len(procs))
+	kids := make(map[int32][]Proc)
+	for _, p := range procs {
+		byPID[p.PID] = p
+		if p.PID != p.PPID {
+			kids[p.PPID] = append(kids[p.PPID], p)
 		}
 	}
-}
 
-func (s *Scanner) tick() {
-	tree, allProcs, err := FastScan(s.rootPID)
-	if err != nil || tree == nil {
-		debug.Log("SCANNER ERR: %v", err)
-		return
+	trees := map[int32]*model.ProcessInfo{}
+	newCount := map[int32]int{}
+	cur := map[int32]int32{}
+	nodes := map[int32]*model.ProcessInfo{}
+	isRoot := map[int32]bool{}
+	for _, r := range roots {
+		isRoot[r] = true
 	}
 
-	currentPIDs := make(map[int32]struct{}, len(allProcs))
-	for _, p := range allProcs {
-		currentPIDs[p.PID] = struct{}{}
-	}
-
-	// Detect new and exited PIDs
-	var newPIDs []int32
-	var exitedPIDs []int32
-
-	for pid := range currentPIDs {
-		if _, existed := s.prevPIDs[pid]; !existed {
-			newPIDs = append(newPIDs, pid)
+	var build func(p Proc, parent *model.ProcessInfo, root int32) *model.ProcessInfo
+	build = func(p Proc, parent *model.ProcessInfo, root int32) *model.ProcessInfo {
+		if _, dup := cur[p.PID]; dup {
+			return nil
 		}
-	}
-	now := time.Now()
-	for pid := range s.prevPIDs {
-		if _, exists := currentPIDs[pid]; !exists {
-			exitedPIDs = append(exitedPIDs, pid)
-			// Keep full info from previous tick
-			if prev, ok := s.prevProcs[pid]; ok {
-				exitTime := now
-				exited := *prev // copy
-				exited.ExitTime = &exitTime
-				exited.Children = nil // no children for exited
-				s.exitedProcs[pid] = &exited
+		info := s.infoFor(p, parent != nil)
+		node := &model.ProcessInfo{
+			PID: p.PID, PPID: p.PPID, Name: p.Comm, Cmdline: info.cmdline, State: p.State,
+			Start: p.Start, CPUPercent: info.cpuPct, RSS: info.rss,
+		}
+		switch {
+		case parent == nil:
+			node.Role = model.RoleOrchestrator
+		case s.be.Hidden(node):
+			return nil
+		case parent.Role == model.RoleOrchestrator:
+			node.Role = s.be.ClassifyChild(node)
+			node.Name = s.be.Label(node)
+		default:
+			node.Role = parent.Role
+			node.Name = s.be.Label(node)
+		}
+		cur[p.PID] = root
+		nodes[p.PID] = node
+		// The first scan of a session finds old processes. They are not spawns.
+		_, seen := s.prev[p.PID]
+		if _, rootSeen := s.prev[root]; !seen && rootSeen {
+			newCount[root]++
+		}
+		for _, k := range kids[p.PID] {
+			// A session can start the Claude Code daemon, which hosts other
+			// sessions. Each session has its own tree.
+			if isRoot[k.PID] {
+				continue
+			}
+			if c := build(k, node, root); c != nil {
+				node.Children = append(node.Children, c)
 			}
 		}
+		sortByStart(node.Children)
+		return node
 	}
-
-	// Prune exited processes older than retention period
-	for pid, ep := range s.exitedProcs {
-		if ep.ExitTime != nil && now.Sub(*ep.ExitTime) > ExitedRetention {
-			delete(s.exitedProcs, pid)
+	for _, r := range roots {
+		if p, ok := byPID[r]; ok {
+			trees[r] = build(p, nil, r)
 		}
 	}
 
-	// Attach exited processes to tree using real PPID hierarchy.
-	// Build a mini-tree from exited procs, then graft onto live tree.
-	exitedByPID := make(map[int32]*model.ProcessInfo)
-	for pid, ep := range s.exitedProcs {
-		name := ep.Name
-		if len(ep.Cmdline) > 0 {
-			name = filepath.Base(ep.Cmdline[0])
-		}
-		if name == "<defunct>" || name == "defunct" {
+	// Processes of the last scan that are gone now have exited.
+	for pid, root := range s.prev {
+		if _, live := cur[pid]; live {
 			continue
 		}
-		copy := *ep
-		copy.Children = nil
-		exitedByPID[pid] = &copy
-	}
-
-	// Wire exited children to exited parents
-	attached := make(map[int32]bool)
-	for pid, ep := range exitedByPID {
-		if parent, ok := exitedByPID[ep.PPID]; ok {
-			parent.Children = append(parent.Children, ep)
-			attached[pid] = true
+		if n, ok := s.nodes[pid]; ok && s.exited[pid] == nil {
+			e := *n
+			e.Children, e.CPUPercent, e.ExitTime = nil, 0, &now
+			s.exited[pid] = &exitedProc{node: &e, root: root}
 		}
 	}
+	s.attachExited(trees, nodes, now)
 
-	// Attach unparented exited procs to live tree nodes
-	for pid, ep := range exitedByPID {
-		if attached[pid] {
-			continue // already a child of another exited proc
+	// Keep the info of hidden processes too, so that their cmdline is read once.
+	for pid := range s.info {
+		if _, alive := byPID[pid]; !alive {
+			delete(s.info, pid)
 		}
-		if liveParent := findNode(tree, ep.PPID); liveParent != nil {
-			liveParent.Children = append(liveParent.Children, ep)
+	}
+	s.prev, s.nodes = cur, nodes
+	return trees, newCount
+}
+
+// attachExited adds each exited process under its parent: a live process, an
+// exited process, or else the root of its tree.
+func (s *Scanner) attachExited(trees map[int32]*model.ProcessInfo, live map[int32]*model.ProcessInfo, now time.Time) {
+	copies := map[int32]*model.ProcessInfo{}
+	for pid, e := range s.exited {
+		if now.Sub(*e.node.ExitTime) > ExitedRetention || trees[e.root] == nil {
+			delete(s.exited, pid)
+			continue
 		}
-		// Orphans (parent not in tree or exited map) are dropped — expected
+		c := *e.node
+		c.Children = nil
+		copies[pid] = &c
 	}
-
-	s.snapshots.Push(tree)
-	s.prevPIDs = currentPIDs
-
-	// Store full process info for next tick's exit handling
-	newPrevProcs := make(map[int32]*model.ProcessInfo, len(allProcs))
-	for _, p := range allProcs {
-		newPrevProcs[p.PID] = p
+	changed := map[*model.ProcessInfo]bool{}
+	for pid, c := range copies {
+		parent := live[c.PPID]
+		if parent == nil {
+			parent = copies[c.PPID]
+		}
+		if parent == nil {
+			parent = trees[s.exited[pid].root]
+		}
+		parent.Children = append(parent.Children, c)
+		changed[parent] = true
 	}
-	s.prevProcs = newPrevProcs
+	for p := range changed {
+		sortByStart(p.Children)
+	}
+}
 
-	// Remove hidden processes from tree
-	filterHidden(tree)
-
-	bus.Send(s.eventBus.ProcessTree, bus.ProcessTreeEvent{
-		Tree:       tree,
-		AllProcs:   allProcs,
-		NewPIDs:    newPIDs,
-		ExitedPIDs: exitedPIDs,
+func sortByStart(nodes []*model.ProcessInfo) {
+	slices.SortFunc(nodes, func(a, b *model.ProcessInfo) int {
+		if c := a.Start.Compare(b.Start); c != 0 {
+			return c
+		}
+		return int(a.PID - b.PID)
 	})
 }
 
-func (s *Scanner) buildTree() (*model.ProcessInfo, []*model.ProcessInfo, error) {
-	procs, err := process.Processes()
-	if err != nil {
-		return nil, nil, fmt.Errorf("listing processes: %w", err)
-	}
-
-	// Build flat map of all processes
-	infoMap := make(map[int32]*model.ProcessInfo, len(procs))
-	for _, p := range procs {
-		info := processToInfo(p)
-		if info != nil {
-			infoMap[info.PID] = info
+// infoFor returns the cached info of a process. It reads the cmdline once per
+// process. The root needs no cmdline: its role and label are fixed.
+func (s *Scanner) infoFor(p Proc, wantCmdline bool) *procInfo {
+	info := s.info[p.PID]
+	if info == nil || !info.start.Equal(p.Start) {
+		info = &procInfo{start: p.Start}
+		if wantCmdline {
+			info.cmdline = s.cmdline(p.PID)
 		}
+		s.info[p.PID] = info
 	}
-
-	// Find root
-	root, ok := infoMap[s.rootPID]
-	if !ok {
-		return nil, nil, fmt.Errorf("root PID %d not found", s.rootPID)
-	}
-
-	// Build tree by attaching children to parents
-	for _, info := range infoMap {
-		if parent, ok := infoMap[info.PPID]; ok && info.PID != s.rootPID {
-			parent.Children = append(parent.Children, info)
-		}
-	}
-
-	// Collect only descendants of root
-	var allProcs []*model.ProcessInfo
-	var collect func(*model.ProcessInfo)
-	collect = func(node *model.ProcessInfo) {
-		allProcs = append(allProcs, node)
-		for _, child := range node.Children {
-			collect(child)
-		}
-	}
-	debug.Log("TREE root=%d children=%d", s.rootPID, len(root.Children))
-	collect(root)
-
-	// Enrich only descendants with expensive fields
-	for _, p := range allProcs {
-		enrichProcessInfo(p)
-	}
-
-	return root, allProcs, nil
+	return info
 }
 
-func filterHidden(node *model.ProcessInfo) {
-	filtered := node.Children[:0]
-	for _, c := range node.Children {
-		name := filepath.Base(c.Name)
-		if len(c.Cmdline) > 0 {
-			name = filepath.Base(c.Cmdline[0])
+// Sample reads RSS and CPU time of every process in the trees with
+// proc_pidinfo. It costs more than Scan, so the collector calls it less often.
+func (s *Scanner) Sample(now time.Time) {
+	for pid, info := range s.info {
+		p := &gopsutil.Process{Pid: pid}
+		if m, err := p.MemoryInfo(); err == nil {
+			info.rss = m.RSS
 		}
-		if name == "caffeinate" {
+		t, err := p.Times()
+		if err != nil {
 			continue
 		}
-		filterHidden(c)
-		filtered = append(filtered, c)
-	}
-	node.Children = filtered
-}
-
-func findNode(root *model.ProcessInfo, pid int32) *model.ProcessInfo {
-	if root.PID == pid {
-		return root
-	}
-	for _, c := range root.Children {
-		if found := findNode(c, pid); found != nil {
-			return found
+		total := t.User + t.System
+		if !info.sampled.IsZero() {
+			if dt := now.Sub(info.sampled).Seconds(); dt > 0 {
+				info.cpuPct = (total - info.cpuTime) / dt * 100
+			}
 		}
+		info.cpuTime, info.sampled = total, now
 	}
-	return nil
-}
-
-func processToInfo(p *process.Process) *model.ProcessInfo {
-	pid := p.Pid
-	ppid, _ := p.Ppid()
-	name, _ := p.Name()
-	cmdline, _ := p.CmdlineSlice()
-
-	return &model.ProcessInfo{
-		PID:     pid,
-		PPID:    ppid,
-		Name:    name,
-		Cmdline: cmdline,
-	}
-}
-
-// enrichProcessInfo adds expensive fields (CPU, mem, state) to a process.
-func enrichProcessInfo(info *model.ProcessInfo) {
-	p, err := process.NewProcess(info.PID)
-	if err != nil {
-		return
-	}
-	info.CPUPercent, _ = p.CPUPercent()
-	if memInfo, err := p.MemoryInfo(); err == nil && memInfo != nil {
-		info.RSS = memInfo.RSS
-	}
-	if status, err := p.Status(); err == nil && len(status) > 0 {
-		info.State = status[0]
-	}
-	if ct, err := p.CreateTime(); err == nil {
-		info.StartTime = time.UnixMilli(ct)
-	}
-}
-
-// RecordExited adds a process to the exited process map from an external source (kqueue).
-func (s *Scanner) RecordExited(info *model.ProcessInfo) {
-	if info == nil {
-		return
-	}
-	s.exitedProcs[info.PID] = info
-}
-
-// Snapshots returns the snapshot history.
-func (s *Scanner) Snapshots() *model.RingBuffer[*model.ProcessInfo] {
-	return s.snapshots
-}
-
-// ExitedProcs returns the map of recently exited processes.
-func (s *Scanner) ExitedProcs() map[int32]*model.ProcessInfo {
-	return s.exitedProcs
 }

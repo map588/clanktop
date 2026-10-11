@@ -2,10 +2,8 @@ package process
 
 import (
 	"fmt"
-	"strings"
 	"time"
 
-	"github.com/map588/clanktop/internal/bus"
 	"github.com/map588/clanktop/internal/model"
 )
 
@@ -16,100 +14,59 @@ const (
 	SpawnRateWindow        = 5 * time.Second
 )
 
+// LeakDetector finds leak patterns in the process tree of one session.
 type LeakDetector struct {
-	eventBus       *bus.EventBus
-	spawnTimestamps []time.Time
+	spawns []time.Time
 }
 
-func NewLeakDetector(eventBus *bus.EventBus) *LeakDetector {
-	return &LeakDetector{
-		eventBus: eventBus,
-	}
-}
+// Check returns an alert for each leak pattern in the tree. newPIDs is the
+// number of processes that appeared since the last check.
+func (ld *LeakDetector) Check(tree *model.ProcessInfo, newPIDs int, now time.Time) []string {
+	var alerts []string
 
-// Check analyzes the current process tree for leak patterns.
-func (ld *LeakDetector) Check(tree *model.ProcessInfo, newPIDs []int32) {
-	ld.checkZombies(tree)
-	ld.checkShellAccumulation(tree)
-	ld.checkSpawnRate(newPIDs)
-}
-
-func (ld *LeakDetector) checkZombies(tree *model.ProcessInfo) {
-	count := 0
-	var walk func(*model.ProcessInfo)
-	walk = func(node *model.ProcessInfo) {
-		if strings.Contains(strings.ToLower(node.State), "zombie") {
-			count++
+	zombies := 0
+	walk(tree, func(n *model.ProcessInfo) {
+		if n.State == "Z" {
+			zombies++
 		}
-		for _, child := range node.Children {
-			walk(child)
+	})
+	if zombies > DefaultZombieThreshold {
+		alerts = append(alerts, fmt.Sprintf("Zombie accumulation: %d zombie processes", zombies))
+	}
+
+	shells := 0
+	for _, c := range tree.Children {
+		if c.Role == model.RoleToolProcess && c.ExitTime == nil {
+			shells++
 		}
 	}
-	walk(tree)
-
-	if count > DefaultZombieThreshold {
-		bus.Send(ld.eventBus.Alerts, bus.AlertEvent{
-			Message:  fmt.Sprintf("Zombie accumulation: %d zombie processes detected", count),
-			Severity: "warning",
-		})
+	if shells > DefaultShellThreshold {
+		alerts = append(alerts, fmt.Sprintf("Shell accumulation: %d live tool shells", shells))
 	}
-}
 
-func (ld *LeakDetector) checkShellAccumulation(tree *model.ProcessInfo) {
-	// Count sh/bash children per agent node
-	agentShells := make(map[int32]int) // agent PID -> shell count
-
-	var walk func(*model.ProcessInfo, int32)
-	walk = func(node *model.ProcessInfo, currentAgentPID int32) {
-		if node.Role == model.RoleOrchestrator || node.Role == model.RoleSubAgent {
-			currentAgentPID = node.PID
-		}
-
-		name := strings.ToLower(node.Name)
-		if (name == "sh" || name == "bash" || name == "zsh") && currentAgentPID != 0 {
-			agentShells[currentAgentPID]++
-		}
-
-		for _, child := range node.Children {
-			walk(child, currentAgentPID)
-		}
-	}
-	walk(tree, 0)
-
-	for agentPID, count := range agentShells {
-		if count > DefaultShellThreshold {
-			bus.Send(ld.eventBus.Alerts, bus.AlertEvent{
-				Message:  fmt.Sprintf("Shell accumulation: agent PID %d has %d shell processes", agentPID, count),
-				Severity: "warning",
-			})
-		}
-	}
-}
-
-func (ld *LeakDetector) checkSpawnRate(newPIDs []int32) {
-	now := time.Now()
-
-	// Record spawn timestamps
 	for range newPIDs {
-		ld.spawnTimestamps = append(ld.spawnTimestamps, now)
+		ld.spawns = append(ld.spawns, now)
 	}
-
-	// Prune old timestamps outside the window
 	cutoff := now.Add(-SpawnRateWindow)
 	start := 0
-	for start < len(ld.spawnTimestamps) && ld.spawnTimestamps[start].Before(cutoff) {
+	for start < len(ld.spawns) && ld.spawns[start].Before(cutoff) {
 		start++
 	}
-	ld.spawnTimestamps = ld.spawnTimestamps[start:]
+	ld.spawns = ld.spawns[start:]
+	if rate := ld.SpawnRate(); rate > DefaultSpawnRateLimit {
+		alerts = append(alerts, fmt.Sprintf("Runaway spawn rate: %.1f/s over %s", rate, SpawnRateWindow))
+	}
+	return alerts
+}
 
-	// Calculate rate
-	if len(ld.spawnTimestamps) > 0 {
-		rate := float64(len(ld.spawnTimestamps)) / SpawnRateWindow.Seconds()
-		if rate > DefaultSpawnRateLimit {
-			bus.Send(ld.eventBus.Alerts, bus.AlertEvent{
-				Message:  fmt.Sprintf("Runaway spawn rate: %.1f/s over %s window", rate, SpawnRateWindow),
-				Severity: "critical",
-			})
-		}
+// SpawnRate is the number of new processes per second in the window.
+func (ld *LeakDetector) SpawnRate() float64 {
+	return float64(len(ld.spawns)) / SpawnRateWindow.Seconds()
+}
+
+func walk(n *model.ProcessInfo, fn func(*model.ProcessInfo)) {
+	fn(n)
+	for _, c := range n.Children {
+		walk(c, fn)
 	}
 }

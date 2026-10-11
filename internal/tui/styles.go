@@ -4,6 +4,7 @@ import (
 	"os"
 
 	"github.com/charmbracelet/lipgloss"
+	"github.com/muesli/termenv"
 )
 
 var noColor = os.Getenv("NO_COLOR") != ""
@@ -28,26 +29,24 @@ var (
 	// Title style
 	titleStyle = lipgloss.NewStyle().Bold(true).Foreground(color("255"))
 
-	// Role colors — all roles fully visible
+	// Role colors
 	orchestratorStyle = lipgloss.NewStyle().Bold(true).Foreground(color("255")) // bold white
 	subAgentStyle     = lipgloss.NewStyle().Foreground(color("6"))              // cyan
 	toolStyle         = lipgloss.NewStyle().Foreground(color("2"))              // green
-	runtimeStyle      = lipgloss.NewStyle().Foreground(color("4"))              // blue
-	infraStyle        = lipgloss.NewStyle().Foreground(color("245"))            // gray (system utils)
 	mcpStyle          = lipgloss.NewStyle().Foreground(color("3"))              // yellow
-	unknownStyle      = lipgloss.NewStyle().Foreground(color("255"))            // white
 
 	// Status colors
 	runningStyle = lipgloss.NewStyle().Foreground(color("2"))   // green
-	exitOkStyle  = lipgloss.NewStyle().Foreground(color("245")) // dim
-	exitErrStyle = lipgloss.NewStyle().Foreground(color("1"))   // red
-	zombieStyle  = lipgloss.NewStyle().Foreground(color("3"))   // yellow
+	busyStyle    = lipgloss.NewStyle().Foreground(color("11"))  // bright yellow: a tool call runs now
+	dimStyle     = lipgloss.NewStyle().Foreground(color("245")) // gray
+	errStyle     = lipgloss.NewStyle().Foreground(color("1"))   // red
 
 	// Alert
-	alertStyle = lipgloss.NewStyle().Bold(true).Foreground(color("3")).Background(color("0"))
+	alertStyle = lipgloss.NewStyle().Bold(true).Foreground(color("3"))
 
-	// Cursor / selection
-	cursorStyle = lipgloss.NewStyle().Background(color("237"))
+	// Cursor in the focused panel, and the selected agent when its panel has no focus
+	cursorStyle   = lipgloss.NewStyle().Background(color("237")).Foreground(color("255"))
+	selectedStyle = lipgloss.NewStyle().Background(color("235"))
 
 	// Header bar
 	headerStyle = lipgloss.NewStyle().Bold(true).Foreground(color("255")).Background(color("62")).Padding(0, 1)
@@ -57,7 +56,10 @@ var (
 	helpDescStyle = lipgloss.NewStyle().Foreground(color("245"))
 )
 
-// SetNoColor allows the CLI to force no-color mode.
+// SetNoColor turns colors off. The styles above are made when the package
+// loads, before the flag is parsed, so the color profile is changed instead.
 func SetNoColor(v bool) {
-	noColor = v
+	if v {
+		lipgloss.SetColorProfile(termenv.Ascii)
+	}
 }

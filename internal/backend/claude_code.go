@@ -1,218 +1,104 @@
 package backend
 
 import (
-	"fmt"
-	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
 
-	"github.com/shirou/gopsutil/v3/process"
-
 	"github.com/map588/clanktop/internal/model"
 )
 
-// Common tool process names that Claude Code spawns.
-var toolProcessNames = map[string]bool{
-	"cat": true, "bat": true,
-	"grep": true, "rg": true, "ag": true,
-	"sed": true, "awk": true,
-	"find": true, "fd": true,
-	"ls": true, "tree": true,
-	"head": true, "tail": true,
-	"wc": true, "sort": true, "uniq": true,
-	"python": true, "python3": true,
-	"git": true, "gh": true,
-	"curl": true, "wget": true,
-	"mkdir": true, "cp": true, "mv": true, "rm": true,
-	"chmod": true, "chown": true,
-	"touch": true, "tee": true,
-	"go": true,
-}
-
-// Hidden processes — system noise, never shown in tree.
-var hiddenProcessNames = map[string]bool{
-	"caffeinate": true,
-}
-
-// Infra process names (long-lived system utilities).
-var infraProcessNames = map[string]bool{
-	"fswatch": true, "watchman": true,
-}
-
-// MCP server indicators in process name or cmdline.
-var mcpServerPatterns = []string{
-	"aidex", "mcp-server", "mcp_server", "-mcp",
-	"modelcontextprotocol",
-}
-
-// Path prefixes to filter out from file access tracking.
+// Path prefixes to filter out from the open-files view.
 var filteredPathPrefixes = []string{
-	"node_modules/",
 	"/usr/lib/",
 	"/usr/local/lib/",
+	"/usr/share/",
 	"/System/",
 	"/Library/",
 	"/opt/homebrew/",
 	"/private/var/",
 	"/tmp/",
 	"/var/folders/",
+	"/dev/",
 }
+
+// Interpreters and package runners. The label of such a process is its first
+// argument that is not a flag or a runner verb.
+var launchers = map[string]bool{
+	"node": true, "python": true, "python3": true, "bun": true, "deno": true,
+	"npx": true, "uvx": true, "bunx": true, "npm": true, "pnpm": true, "uv": true,
+}
+
+var launcherVerbs = map[string]bool{"exec": true, "run": true, "x": true, "dlx": true, "tool": true}
 
 // evalPattern matches eval '<command>' in a Claude Code shell wrapper.
 // Claude Code writes each single quote in the command as '"'"'.
 var evalPattern = regexp.MustCompile(`eval '((?:[^']|'"'"')*)'`)
 
 type ClaudeCode struct {
-	mcpNames map[string]bool // command names from config
+	home string
 }
 
-func NewClaudeCode(projectDir string) *ClaudeCode {
-	return &ClaudeCode{
-		mcpNames: LoadMCPServerNames(projectDir),
-	}
+func NewClaudeCode(home string) *ClaudeCode {
+	return &ClaudeCode{home: home}
 }
 
 func (c *ClaudeCode) Name() string {
 	return "claude-code"
 }
 
-func (c *ClaudeCode) FindRootProcess() (int32, error) {
-	procs, err := process.Processes()
-	if err != nil {
-		return 0, fmt.Errorf("listing processes: %w", err)
-	}
-
-	var candidates []int32
-	for _, p := range procs {
-		cmdline, err := p.CmdlineSlice()
-		if err != nil || len(cmdline) == 0 {
-			continue
-		}
-
-		base := filepath.Base(cmdline[0])
-		if base == "claude" {
-			candidates = append(candidates, p.Pid)
-		}
-	}
-
-	switch len(candidates) {
-	case 0:
-		return 0, fmt.Errorf("no Claude Code process found")
-	case 1:
-		return candidates[0], nil
-	default:
-		return candidates[0], nil
-	}
+func (c *ClaudeCode) Sessions() []model.Session {
+	return ListSessions(filepath.Join(c.home, ".claude", "sessions"))
 }
 
-func (c *ClaudeCode) ClassifyProcess(proc *model.ProcessInfo) model.ProcessRole {
-	cmdStr := strings.Join(proc.Cmdline, " ")
-
-	var cmdBase string
-	if len(proc.Cmdline) > 0 {
-		cmdBase = strings.ToLower(filepath.Base(proc.Cmdline[0]))
-	}
-
-	// Native claude binary
-	if cmdBase == "claude" {
-		if strings.Contains(cmdStr, "--subagent") || strings.Contains(cmdStr, "subagent") {
-			return model.RoleSubAgent
-		}
-		return model.RoleOrchestrator
-	}
-
-	// MCP servers — check config-loaded names first
-	if c.mcpNames[cmdBase] {
-		return model.RoleMCPServer
-	}
-	// Check all cmdline args against MCP names (catches npx/uvx <server>)
-	for _, arg := range proc.Cmdline {
-		if c.mcpNames[filepath.Base(arg)] {
-			return model.RoleMCPServer
-		}
-	}
-	// Fallback pattern matching
-	cmdLower := strings.ToLower(cmdStr)
-	for _, pattern := range mcpServerPatterns {
-		if strings.Contains(cmdLower, pattern) {
-			return model.RoleMCPServer
-		}
-	}
-
-	// Shell processes — tool process (wrapper or standalone)
-	if cmdBase == "zsh" || cmdBase == "bash" || cmdBase == "sh" {
-		return model.RoleToolProcess
-	}
-
-	// Known infra processes
-	if infraProcessNames[cmdBase] {
-		return model.RoleInfra
-	}
-
-	// Known tool processes
-	if toolProcessNames[cmdBase] {
-		return model.RoleToolProcess
-	}
-
-	return model.RoleUnknown
-}
-
-// isClaudeShellWrapper detects zsh -c "source .../shell-snapshots/..." wrapper commands
-func isClaudeShellWrapper(cmdStr string) bool {
-	return strings.Contains(cmdStr, "shell-snapshots") || strings.Contains(cmdStr, "claude")
-}
-
-// ExtractToolFromWrapper parses a Claude Code zsh wrapper command to extract
-// the actual tool command being run inside eval '...'.
-// Returns the extracted command string, or empty if not a wrapper.
-func ExtractToolFromWrapper(cmdline []string) string {
-	if len(cmdline) < 3 {
+// LogPath finds ~/.claude/projects/*/<sessionID>.jsonl. Claude Code names the
+// project directory after the cwd with each non-alphanumeric character replaced
+// by '-'. A glob avoids a dependency on that encoding.
+func (c *ClaudeCode) LogPath(sessionID string) string {
+	matches, _ := filepath.Glob(filepath.Join(c.home, ".claude", "projects", "*", sessionID+".jsonl"))
+	if len(matches) == 0 {
 		return ""
 	}
-	base := filepath.Base(cmdline[0])
-	if base != "zsh" && base != "bash" && base != "sh" {
-		return ""
-	}
-
-	cmdStr := strings.Join(cmdline, " ")
-	if !strings.Contains(cmdStr, "shell-snapshots") {
-		return ""
-	}
-
-	// Extract the eval '...' portion
-	matches := evalPattern.FindStringSubmatch(cmdStr)
-	if len(matches) >= 2 {
-		return strings.ReplaceAll(matches[1], `'"'"'`, "'")
-	}
-
-	return ""
+	return matches[0]
 }
 
-func (c *ClaudeCode) LogSources(rootPID int32) []LogSource {
-	home, err := os.UserHomeDir()
-	if err != nil {
+// SubAgentLogs finds <project dir>/<sessionID>/subagents/agent-*.jsonl.
+func (c *ClaudeCode) SubAgentLogs(logPath, sessionID string) []string {
+	if logPath == "" {
 		return nil
 	}
-
-	var sources []LogSource
-	logDir := filepath.Join(home, ".claude", "logs")
-	if entries, err := os.ReadDir(logDir); err == nil {
-		for _, e := range entries {
-			if !e.IsDir() && strings.HasSuffix(e.Name(), ".log") {
-				sources = append(sources, LogSource{
-					Path:   filepath.Join(logDir, e.Name()),
-					Format: "text",
-				})
-			}
-		}
-	}
-
-	return sources
+	matches, _ := filepath.Glob(filepath.Join(filepath.Dir(logPath), sessionID, "subagents", "agent-*.jsonl"))
+	return matches
 }
 
-func (c *ClaudeCode) ParseLogLine(line string) *AgentEvent {
-	return nil
+// ClassifyChild: the agent runs Bash tool calls, hooks and the status line
+// through a shell. Every other child is a long-lived MCP or LSP server.
+func (c *ClaudeCode) ClassifyChild(proc *model.ProcessInfo) model.ProcessRole {
+	if isShell(cmdBase(proc)) {
+		return model.RoleToolProcess
+	}
+	return model.RoleMCPServer
+}
+
+func (c *ClaudeCode) Hidden(proc *model.ProcessInfo) bool {
+	return cmdBase(proc) == "caffeinate"
+}
+
+func (c *ClaudeCode) Label(proc *model.ProcessInfo) string {
+	if cmd := ExtractToolFromWrapper(proc.Cmdline); cmd != "" {
+		first, _, _ := strings.Cut(cmd, "\n")
+		return first
+	}
+	base := cmdBase(proc)
+	if launchers[base] {
+		for _, arg := range proc.Cmdline[1:] {
+			if strings.HasPrefix(arg, "-") || launcherVerbs[arg] {
+				continue
+			}
+			return filepath.Base(arg)
+		}
+	}
+	return base
 }
 
 func (c *ClaudeCode) FileAccessFilter(path string) bool {
@@ -221,8 +107,36 @@ func (c *ClaudeCode) FileAccessFilter(path string) bool {
 			return false
 		}
 	}
-	if strings.Contains(path, "node_modules") {
-		return false
+	return !strings.Contains(path, "node_modules")
+}
+
+// cmdBase is the base name of the executable. It uses the cmdline when it is
+// known, else the ps name.
+func cmdBase(proc *model.ProcessInfo) string {
+	if len(proc.Cmdline) > 0 {
+		return filepath.Base(proc.Cmdline[0])
 	}
-	return true
+	return filepath.Base(proc.Name)
+}
+
+func isShell(base string) bool {
+	return base == "zsh" || base == "bash" || base == "sh"
+}
+
+// ExtractToolFromWrapper parses a Claude Code zsh wrapper command to extract
+// the actual tool command being run inside eval '...'.
+// Returns the extracted command string, or empty if not a wrapper.
+func ExtractToolFromWrapper(cmdline []string) string {
+	if len(cmdline) < 3 || !isShell(filepath.Base(cmdline[0])) {
+		return ""
+	}
+	cmdStr := strings.Join(cmdline, " ")
+	if !strings.Contains(cmdStr, "shell-snapshots") {
+		return ""
+	}
+	matches := evalPattern.FindStringSubmatch(cmdStr)
+	if len(matches) >= 2 {
+		return strings.ReplaceAll(matches[1], `'"'"'`, "'")
+	}
+	return ""
 }

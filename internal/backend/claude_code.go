@@ -40,7 +40,6 @@ var infraProcessNames = map[string]bool{
 	"fswatch": true, "watchman": true,
 }
 
-
 // MCP server indicators in process name or cmdline.
 var mcpServerPatterns = []string{
 	"aidex", "mcp-server", "mcp_server", "-mcp",
@@ -60,8 +59,9 @@ var filteredPathPrefixes = []string{
 	"/var/folders/",
 }
 
-// Matches eval '<command>' in shell wrapper commands
-var evalPattern = regexp.MustCompile(`eval '([^']*)'`)
+// evalPattern matches eval '<command>' in a Claude Code shell wrapper.
+// Claude Code writes each single quote in the command as '"'"'.
+var evalPattern = regexp.MustCompile(`eval '((?:[^']|'"'"')*)'`)
 
 type ClaudeCode struct {
 	mcpNames map[string]bool // command names from config
@@ -183,7 +183,7 @@ func ExtractToolFromWrapper(cmdline []string) string {
 	// Extract the eval '...' portion
 	matches := evalPattern.FindStringSubmatch(cmdStr)
 	if len(matches) >= 2 {
-		return matches[1]
+		return strings.ReplaceAll(matches[1], `'"'"'`, "'")
 	}
 
 	return ""

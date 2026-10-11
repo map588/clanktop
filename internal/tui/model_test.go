@@ -101,3 +101,59 @@ func TestKeyBurstMovesOncePerRune(t *testing.T) {
 		t.Fatalf("after jj the third row must be selected, got PID %d sub %v", r.v.PID, r.sub != nil)
 	}
 }
+
+// The roster is a tree like the process tree of htop: a session, the
+// subagents it started (nested by the call that started them), and the
+// background session that it parked its work in.
+func TestRosterTree(t *testing.T) {
+	now := time.Now()
+	m := NewModel(nil, "claude-code", "/Users/x")
+	m.now = now
+	m.views = []model.AgentView{
+		{Session: model.Session{PID: 100, Name: "a", ParkedJobID: "j1"}, SubAgents: []model.SubAgent{
+			// p1 stopped long ago, but its subagent q1 runs, so p1 stays.
+			{ID: "p1", Start: now.Add(-time.Hour)},
+			{ID: "q1", ParentID: "p1", Running: true, Start: now.Add(-time.Minute)},
+			{ID: "r1", Running: true, Start: now},
+			{ID: "old", Start: now.Add(-time.Hour)},
+		}},
+		{Session: model.Session{PID: 200, Name: "b", Kind: "bg", JobID: "j1"}},
+		{Session: model.Session{PID: 300, Name: "c"}},
+	}
+	var got []string
+	for _, r := range m.rows() {
+		got = append(got, r.prefix+r.key)
+	}
+	want := []string{
+		"100",
+		"├─ 100/p1",
+		"│  └─ 100/q1",
+		"├─ 100/r1",
+		"└─ 200",
+		"300",
+	}
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("got\n%s\nwant\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
+	}
+}
+
+// Bad data with cycles must not hang the TUI or hide a session.
+func TestRosterTreeCycles(t *testing.T) {
+	now := time.Now()
+	m := NewModel(nil, "claude-code", "/Users/x")
+	m.now = now
+	m.views = []model.AgentView{
+		{Session: model.Session{PID: 100, JobID: "j1", ParkedJobID: "j2"}, SubAgents: []model.SubAgent{
+			{ID: "a", ParentID: "b", Start: now.Add(-time.Hour)},
+			{ID: "b", ParentID: "a", Start: now.Add(-time.Hour)},
+		}},
+		{Session: model.Session{PID: 200, JobID: "j2", ParkedJobID: "j1"}},
+	}
+	keys := map[string]bool{}
+	for _, r := range m.rows() {
+		keys[r.key] = true
+	}
+	if !keys["100"] || !keys["200"] {
+		t.Fatalf("sessions in a parking cycle must be shown: %v", keys)
+	}
+}

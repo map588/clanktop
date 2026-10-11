@@ -77,7 +77,12 @@ clanktop finds all live Claude Code sessions. It needs no PID and no root access
 
 ### Agents (left)
 
-One line for each session, and one line for each subagent that runs or ran in the last 10 minutes.
+A tree of agents, like the process tree in htop. Under each session are:
+
+- The subagents that it started. A subagent that another subagent started is under that subagent.
+- The background session that it parked its work in.
+
+A subagent stays in the tree while it runs and for 10 minutes after it stops. A stopped subagent is gray.
 
 - `●` busy, `○` idle or other status, from the session registry
 - The session name, `bg` for a background session, and the tool call that runs now with its elapsed time
@@ -109,13 +114,13 @@ clanktop reads files that Claude Code writes for its own use. They are not a pub
 
 ### Sessions
 
-Claude Code writes one file for each live session to `~/.claude/sessions/<pid>.json`: the session ID, the working directory, the kind (interactive or bg), the status (busy or idle), and the name. clanktop reads this directory every second. It does not read the `*.key` files in this directory.
+Claude Code writes one file for each live session to `~/.claude/sessions/<pid>.json`: the session ID, the working directory, the kind (interactive or bg), the status (busy or idle), and the name. clanktop reads this directory every second. It does not read the `*.key` files in this directory. It ignores spare processes (`"spare": true`), which wait for work. An interactive session whose `parkedJobId` is the `jobId` of a background session is the parent of that session.
 
 ### Tool calls and files
 
 Each session writes a JSONL log to `~/.claude/projects/<project>/<session-id>.jsonl`. clanktop reads the full log when it starts and then reads new lines every 500 ms. It pairs each `tool_use` record with its `tool_result` record to get the duration and the error status. The file operations come from the arguments of the Read, Write, Edit, MultiEdit, NotebookEdit, Grep, and Glob calls.
 
-Subagents run inside the agent process. They are not separate processes. Each subagent writes its own log to `<project>/<session-id>/subagents/agent-<id>.jsonl`, with a `.meta.json` file that gives its type and description.
+Subagents run inside the agent process. They are not separate processes. Each subagent writes its own log to `<project>/<session-id>/subagents/agent-<id>.jsonl`, with a `.meta.json` file that gives its type, its description, and the ID of the Agent call that started it. clanktop finds that call in the session log or in the log of another subagent to put the subagent in the tree.
 
 ### Processes
 

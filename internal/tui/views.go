@@ -140,14 +140,14 @@ func (m Model) agentLines() []string {
 	lines := make([]string, len(rows))
 	for i, r := range rows {
 		if r.sub != nil {
-			state := dimStyle.Render("done")
+			name, state := dimStyle.Render(agentName(r)), dimStyle.Render("done")
 			if r.sub.Running {
-				state = runningStyle.Render("running")
+				name, state = subAgentStyle.Render(agentName(r)), runningStyle.Render("running")
 				if c := runningCall(r.sub.Calls); c != nil {
 					state = m.callState(c)
 				}
 			}
-			lines[i] = fmt.Sprintf("  └ %s %s", subAgentStyle.Render(r.sub.Type+": "+r.sub.Description), state)
+			lines[i] = fmt.Sprintf("%s%s %s", dimStyle.Render(r.prefix), name, state)
 			continue
 		}
 		v := r.v
@@ -170,7 +170,7 @@ func (m Model) agentLines() []string {
 		if len(v.Alerts) > 0 {
 			alert = alertStyle.Render(" ⚠")
 		}
-		lines[i] = fmt.Sprintf("%s %s %s%s%s %s", dot, orchestratorStyle.Render(agentName(r)), status, kind, alert, what)
+		lines[i] = fmt.Sprintf("%s%s %s %s%s%s %s", dimStyle.Render(r.prefix), dot, orchestratorStyle.Render(agentName(r)), status, kind, alert, what)
 	}
 	return lines
 }

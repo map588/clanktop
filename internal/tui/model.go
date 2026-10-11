@@ -161,25 +161,118 @@ func editCmd(path string) tea.Cmd {
 }
 
 // row is one line of the agent roster: a session, or a subagent of a session.
+// prefix holds the tree lines before the row, as in the process tree of htop.
 type row struct {
-	key string
-	v   *model.AgentView
-	sub *model.SubAgent
+	key    string
+	v      *model.AgentView
+	sub    *model.SubAgent
+	prefix string
 }
 
+// rows builds the roster tree. Under a session are the subagents that it
+// started, each under the subagent whose Agent call started it, and then the
+// background session that it parked its work in.
 func (m *Model) rows() []row {
-	var out []row
+	byJob := map[string]*model.AgentView{}
+	for i := range m.views {
+		if j := m.views[i].JobID; j != "" {
+			byJob[j] = &m.views[i]
+		}
+	}
+	parkedIn := map[*model.AgentView]*model.AgentView{}
+	isParked := map[*model.AgentView]bool{}
 	for i := range m.views {
 		v := &m.views[i]
-		out = append(out, row{key: strconv.Itoa(int(v.PID)), v: v})
-		for j := range v.SubAgents {
-			s := &v.SubAgents[j]
-			if s.Running || m.now.Sub(lastActivity(s)) < recentSubAgent {
-				out = append(out, row{key: fmt.Sprintf("%d/%s", v.PID, s.ID), v: v, sub: s})
+		if p := byJob[v.ParkedJobID]; v.ParkedJobID != "" && p != nil && p != v {
+			parkedIn[v], isParked[p] = p, true
+		}
+	}
+
+	type node struct {
+		sub  *model.SubAgent
+		sess *model.AgentView
+	}
+	var out []row
+	done := map[string]bool{} // Row keys already in out. Stops a cycle in bad data.
+	var addSession func(v *model.AgentView, prefix, indent string)
+	var addChildren func(v *model.AgentView, kids []node, indent string)
+	addChildren = func(v *model.AgentView, kids []node, indent string) {
+		for i, k := range kids {
+			branch, next := "├─ ", "│  "
+			if i == len(kids)-1 {
+				branch, next = "└─ ", "   "
 			}
+			if k.sess != nil {
+				addSession(k.sess, indent+branch, indent+next)
+				continue
+			}
+			key := fmt.Sprintf("%d/%s", v.PID, k.sub.ID)
+			if done[key] {
+				continue
+			}
+			done[key] = true
+			out = append(out, row{key: key, v: v, sub: k.sub, prefix: indent + branch})
+			var sub []node
+			for _, s := range m.subAgents(v, k.sub.ID) {
+				sub = append(sub, node{sub: s})
+			}
+			addChildren(v, sub, indent+next)
+		}
+	}
+	addSession = func(v *model.AgentView, prefix, indent string) {
+		key := strconv.Itoa(int(v.PID))
+		if done[key] {
+			return
+		}
+		done[key] = true
+		out = append(out, row{key: key, v: v, prefix: prefix})
+		var kids []node
+		for _, s := range m.subAgents(v, "") {
+			kids = append(kids, node{sub: s})
+		}
+		if p := parkedIn[v]; p != nil {
+			kids = append(kids, node{sess: p})
+		}
+		addChildren(v, kids, indent)
+	}
+	for i := range m.views {
+		if !isParked[&m.views[i]] {
+			addSession(&m.views[i], "", "")
+		}
+	}
+	// A cycle of parked sessions has no top. Show such sessions at the top level.
+	for i := range m.views {
+		addSession(&m.views[i], "", "")
+	}
+	return out
+}
+
+// subAgents returns the shown subagents of v whose parent is parentID. A
+// subagent is shown while it runs, for a time after it stops, and while one
+// of its own subagents is shown.
+func (m *Model) subAgents(v *model.AgentView, parentID string) []*model.SubAgent {
+	var out []*model.SubAgent
+	for i := range v.SubAgents {
+		if s := &v.SubAgents[i]; s.ParentID == parentID && s.ID != parentID && m.shown(v, s, 0) {
+			out = append(out, s)
 		}
 	}
 	return out
+}
+
+func (m *Model) shown(v *model.AgentView, s *model.SubAgent, depth int) bool {
+	if s.Running || m.now.Sub(lastActivity(s)) < recentSubAgent {
+		return true
+	}
+	if depth > len(v.SubAgents) { // A cycle in bad data.
+		return false
+	}
+	for i := range v.SubAgents {
+		if c := &v.SubAgents[i]; c.ParentID == s.ID && c != s && m.shown(v, c, depth+1) {
+			return true
+		}
+	}
+	return false
 }
 
 func lastActivity(s *model.SubAgent) time.Time {

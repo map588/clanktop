@@ -15,15 +15,18 @@ import (
 // sessionFile is the format of ~/.claude/sessions/<pid>.json.
 // The directory also holds <pid>.<hash>.key files. They are secrets and are never read.
 type sessionFile struct {
-	PID       int32  `json:"pid"`
-	SessionID string `json:"sessionId"`
-	Cwd       string `json:"cwd"`
-	Kind      string `json:"kind"`
-	Status    string `json:"status"`
-	Name      string `json:"name"`
-	Version   string `json:"version"`
-	StartedAt int64  `json:"startedAt"` // Unix milliseconds
-	UpdatedAt int64  `json:"updatedAt"` // Unix milliseconds
+	PID         int32  `json:"pid"`
+	SessionID   string `json:"sessionId"`
+	Cwd         string `json:"cwd"`
+	Kind        string `json:"kind"`
+	Status      string `json:"status"`
+	Name        string `json:"name"`
+	Version     string `json:"version"`
+	StartedAt   int64  `json:"startedAt"` // Unix milliseconds
+	UpdatedAt   int64  `json:"updatedAt"` // Unix milliseconds
+	JobID       string `json:"jobId"`
+	ParkedJobID string `json:"parkedJobId"`
+	Spare       bool   `json:"spare"` // A started process that waits for work
 }
 
 // ListSessions reads the session registry in dir. It drops entries whose process
@@ -39,19 +42,21 @@ func ListSessions(dir string) []model.Session {
 			continue
 		}
 		var f sessionFile
-		if json.Unmarshal(data, &f) != nil || f.PID <= 0 || f.SessionID == "" || !alive(f.PID) {
+		if json.Unmarshal(data, &f) != nil || f.PID <= 0 || f.SessionID == "" || f.Spare || !alive(f.PID) {
 			continue
 		}
 		out = append(out, model.Session{
-			PID:       f.PID,
-			SessionID: f.SessionID,
-			Cwd:       f.Cwd,
-			Kind:      f.Kind,
-			Status:    f.Status,
-			Name:      f.Name,
-			Version:   f.Version,
-			StartedAt: time.UnixMilli(f.StartedAt),
-			UpdatedAt: time.UnixMilli(f.UpdatedAt),
+			PID:         f.PID,
+			SessionID:   f.SessionID,
+			Cwd:         f.Cwd,
+			Kind:        f.Kind,
+			Status:      f.Status,
+			Name:        f.Name,
+			Version:     f.Version,
+			StartedAt:   time.UnixMilli(f.StartedAt),
+			UpdatedAt:   time.UnixMilli(f.UpdatedAt),
+			JobID:       f.JobID,
+			ParkedJobID: f.ParkedJobID,
 		})
 	}
 	slices.SortFunc(out, func(a, b model.Session) int { return a.StartedAt.Compare(b.StartedAt) })

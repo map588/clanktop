@@ -37,9 +37,12 @@ func TestListSessions(t *testing.T) {
 	dead := deadPID(t)
 	// Real registry record (trimmed), with the live PID of this test.
 	writeFile(t, filepath.Join(dir, fmt.Sprintf("%d.json", live)), fmt.Sprintf(
-		`{"pid":%d,"sessionId":"2c180fbe-0809-42cf-90e8-6a37acb4ab73","cwd":"/Users/x/git/tui/clanktop","startedAt":1791733816030,"version":"2.1.296","kind":"interactive","entrypoint":"cli","name":"clanktop-cf","status":"busy","updatedAt":1791733996615}`, live))
+		`{"pid":%d,"sessionId":"2c180fbe-0809-42cf-90e8-6a37acb4ab73","cwd":"/Users/x/git/tui/clanktop","startedAt":1791733816030,"version":"2.1.296","kind":"interactive","entrypoint":"cli","name":"clanktop-cf","status":"busy","updatedAt":1791733996615,"parkedJobId":"e4c7b3f7"}`, live))
 	writeFile(t, filepath.Join(dir, fmt.Sprintf("%d.json", dead)), fmt.Sprintf(
 		`{"pid":%d,"sessionId":"dead","cwd":"/x","startedAt":1,"kind":"interactive","status":"idle"}`, dead))
+	// A spare is a started process that waits for work. It is not an agent.
+	writeFile(t, filepath.Join(dir, "1.json"),
+		`{"pid":1,"sessionId":"8c3dd23f-6fde","kind":"bg","name":"8c3dd23f","agent":"claude","jobId":"8c3dd23f","spare":true,"status":"idle"}`)
 	// Key files are secrets. ListSessions must not read them.
 	writeFile(t, filepath.Join(dir, fmt.Sprintf("%d.abc.key", live)), "not json")
 	writeFile(t, filepath.Join(dir, "broken.json"), "{")
@@ -51,7 +54,7 @@ func TestListSessions(t *testing.T) {
 	s := got[0]
 	if s.PID != int32(live) || s.SessionID != "2c180fbe-0809-42cf-90e8-6a37acb4ab73" ||
 		s.Cwd != "/Users/x/git/tui/clanktop" || s.Kind != "interactive" || s.Status != "busy" ||
-		s.Name != "clanktop-cf" || s.StartedAt.UnixMilli() != 1791733816030 {
+		s.Name != "clanktop-cf" || s.StartedAt.UnixMilli() != 1791733816030 || s.ParkedJobID != "e4c7b3f7" {
 		t.Fatalf("wrong session: %+v", s)
 	}
 }

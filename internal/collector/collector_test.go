@@ -116,3 +116,36 @@ func TestPIDFilter(t *testing.T) {
 		t.Fatalf("filter kept %d sessions", len(got))
 	}
 }
+
+// A subagent can start a subagent. ParentID names the subagent whose Agent
+// call started it, or is empty when the session started it.
+func TestSubAgentParent(t *testing.T) {
+	home := t.TempDir()
+	proj := filepath.Join(home, ".claude", "projects", "-Users-x-proj-a")
+	subs := filepath.Join(proj, "s1", "subagents")
+	agentCall := func(id, ts string) string {
+		return `{"type":"assistant","timestamp":"` + ts + `","message":{"role":"assistant","stop_reason":"tool_use","content":[{"type":"tool_use","id":"` + id + `","name":"Agent","input":{"subagent_type":"Explore","description":"d"}}]}}` + "\n"
+	}
+	registry(t, home, "s1", "busy")
+	write(t, filepath.Join(proj, "s1.jsonl"), agentCall("toolu_P", "2026-10-11T15:00:00Z"))
+	write(t, filepath.Join(subs, "agent-p1.jsonl"), agentCall("toolu_Q", "2026-10-11T15:00:01Z"))
+	write(t, filepath.Join(subs, "agent-p1.meta.json"), `{"agentType":"Plan","description":"outer","toolUseId":"toolu_P","spawnDepth":1}`)
+	write(t, filepath.Join(subs, "agent-q1.jsonl"), agentCall("toolu_R", "2026-10-11T15:00:02Z"))
+	write(t, filepath.Join(subs, "agent-q1.meta.json"), `{"agentType":"Explore","description":"inner","toolUseId":"toolu_Q","spawnDepth":2}`)
+
+	c := New(backend.NewClaudeCode(home), 0)
+	defer c.close()
+	c.PollSessions()
+	c.PollLogs()
+	v := onlyView(t, c, time.Now())
+	if len(v.SubAgents) != 2 {
+		t.Fatalf("subagents: %+v", v.SubAgents)
+	}
+	parent := map[string]string{}
+	for _, s := range v.SubAgents {
+		parent[s.ID] = s.ParentID
+	}
+	if parent["p1"] != "" || parent["q1"] != "p1" {
+		t.Fatalf("parents: %v", parent)
+	}
+}

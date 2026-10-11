@@ -254,6 +254,23 @@ func walkLive(n *model.ProcessInfo, fn func(*model.ProcessInfo)) {
 	}
 }
 
+// linkParents sets the ParentID of each subagent to the subagent whose log
+// has the Agent call that started it. A call in the session log, or a call
+// that is not found, leaves ParentID empty.
+func linkParents(subs []model.SubAgent) {
+	owner := map[string]string{} // Tool call ID -> subagent ID
+	for _, s := range subs {
+		for _, c := range s.Calls {
+			owner[c.ID] = s.ID
+		}
+	}
+	for i := range subs {
+		if p := owner[subs[i].ToolUseID]; p != subs[i].ID {
+			subs[i].ParentID = p
+		}
+	}
+}
+
 // Snapshot returns a copy of the state of all sessions, the oldest session first.
 func (c *Collector) Snapshot(now time.Time) []model.AgentView {
 	c.mu.Lock()
@@ -289,6 +306,7 @@ func (c *Collector) Snapshot(now time.Time) []model.AgentView {
 			})
 		}
 		slices.SortFunc(v.SubAgents, func(a, b model.SubAgent) int { return a.Start.Compare(b.Start) })
+		linkParents(v.SubAgents)
 		out = append(out, v)
 	}
 	slices.SortFunc(out, func(a, b model.AgentView) int {

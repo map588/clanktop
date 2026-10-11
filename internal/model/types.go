@@ -52,6 +52,10 @@ type Session struct {
 	Version   string    `json:"version"`
 	StartedAt time.Time `json:"startedAt"`
 	UpdatedAt time.Time `json:"updatedAt"`
+	// JobID is set for a background session. An interactive session that
+	// moved its work to the background has ParkedJobID equal to that JobID.
+	JobID       string `json:"jobId,omitempty"`
+	ParkedJobID string `json:"parkedJobId,omitempty"`
 }
 
 type FileOp int
@@ -102,6 +106,7 @@ type SubAgent struct {
 	Type        string     `json:"type"`
 	Description string     `json:"description"`
 	ToolUseID   string     `json:"toolUseId"`
+	ParentID    string     `json:"parentId,omitempty"` // Subagent that made the call ToolUseID; "" for the session
 	Start       time.Time  `json:"start"`
 	Running     bool       `json:"running"`
 	Calls       []ToolCall `json:"calls"`
